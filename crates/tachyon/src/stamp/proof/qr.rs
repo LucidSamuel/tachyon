@@ -62,7 +62,7 @@ impl Header for QrIntake {
         TachygramSetCommit,
     );
 
-    const SUFFIX: Suffix = Suffix::new(5);
+    const SUFFIX: Suffix = Suffix::new(4);
 
     fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
         let (epoch, anchor_prev, anchor_end, discriminant, profile, contents) = *data;
@@ -102,7 +102,7 @@ impl Header for QrIntakeSides {
         TachygramSetCommit,
     );
 
-    const SUFFIX: Suffix = Suffix::new(11);
+    const SUFFIX: Suffix = Suffix::new(10);
 
     fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
         let (epoch, anchor_prev, anchor_end, discriminant, profile, non_residue, residue) = *data;
@@ -138,7 +138,7 @@ impl Step for QrSummaryIntake {
     /// `(discriminant)`
     type Witness<'source> = (QrDiscriminant,);
 
-    const INDEX: Index = Index::new(17);
+    const INDEX: Index = Index::new(15);
 
     fn witness<'source>(
         &self,
@@ -179,7 +179,7 @@ impl Step for QrStampIntakeSeed {
     /// `(anchor_prev, epoch, discriminant, stamp_commit)`
     type Witness<'source> = (Anchor, EpochIndex, QrDiscriminant, TachygramSetCommit);
 
-    const INDEX: Index = Index::new(23);
+    const INDEX: Index = Index::new(21);
 
     fn witness<'source>(
         &self,
@@ -212,11 +212,11 @@ impl Step for QrStampIntakeSeed {
 /// # Soundness
 ///
 /// `anchor` and `epoch` are free witnesses. [`QrBucketSeal`] requires `anchor`
-/// to have epoch-link form into `epoch` and crosses from it, so the sealed
-/// bucket ends on the published entry anchor of `epoch + 1` only if `anchor`
-/// is both the entry and the final anchor of `epoch`: only if the epoch
-/// published no stamp. `discriminant` is a free witness; see
-/// [`QrDiscriminant`].
+/// to be a boundary digest into `epoch`. [`QrBucketSeal`] computes the boundary
+/// digest of `anchor` into `epoch + 1`. The sealed bucket ends on the published
+/// entry anchor of `epoch + 1` only if `anchor` is both the entry anchor and
+/// the final anchor of `epoch`. That holds only when the epoch published no
+/// stamp. `discriminant` is a free witness. See [`QrDiscriminant`].
 #[derive(Debug)]
 pub struct QrEmptyIntakeSeed;
 
@@ -228,7 +228,7 @@ impl Step for QrEmptyIntakeSeed {
     /// `(anchor, epoch, discriminant)`
     type Witness<'source> = (Anchor, EpochIndex, QrDiscriminant);
 
-    const INDEX: Index = Index::new(25);
+    const INDEX: Index = Index::new(23);
 
     fn witness<'source>(
         &self,
@@ -269,7 +269,7 @@ impl Step for QrIntakeMerge {
     /// `(left_contents, right_contents, merged)`
     type Witness<'source> = (TachygramSetPoly, TachygramSetPoly, TachygramSetPoly);
 
-    const INDEX: Index = Index::new(18);
+    const INDEX: Index = Index::new(16);
 
     fn witness<'source>(
         &self,
@@ -363,7 +363,7 @@ impl Step for QrIntakeSplit {
     /// `(contents, non_residue, residue)`
     type Witness<'source> = (TachygramSetPoly, TachygramSetPoly, TachygramSetPoly);
 
-    const INDEX: Index = Index::new(19);
+    const INDEX: Index = Index::new(17);
 
     fn witness<'source>(
         &self,
@@ -450,7 +450,7 @@ impl Step for QrSideDescend {
     /// `(bit, sibling_contents, interpolant, quotient)`
     type Witness<'source> = (bool, TachygramSetPoly, QrInterpolantPoly, QrQuotientPoly);
 
-    const INDEX: Index = Index::new(20);
+    const INDEX: Index = Index::new(18);
 
     fn witness<'source>(
         &self,
@@ -530,11 +530,11 @@ impl Step for QrSideDescend {
 
 /// One profile's members over a whole epoch.
 ///
-/// The bucket covers `[anchor_start, anchor_next)`: `anchor_start` is the
-/// entry anchor of `epoch`, and `anchor_next` is the entry anchor of
-/// `epoch + 1`, which belongs to that epoch and is excluded. [`QrBucketSeal`]
-/// gives both bounds epoch-link form, folding `anchor_next` from the output of
-/// the bucket's last stamp fold.
+/// The bucket covers `[anchor_start, anchor_next)`. Both bounds are boundary
+/// digests. The range excludes `anchor_next`. In a bucket that a
+/// consensus-accepted spend uses, `anchor_start` is the entry anchor of `epoch`
+/// and `anchor_next` is the entry anchor of `epoch + 1`. [`QrBucketSeal`]
+/// computes `anchor_next` from the intake's `anchor_end`.
 #[derive(Clone, Debug)]
 pub struct QrBucket;
 
@@ -549,7 +549,7 @@ impl Header for QrBucket {
         TachygramSetCommit,
     );
 
-    const SUFFIX: Suffix = Suffix::new(12);
+    const SUFFIX: Suffix = Suffix::new(11);
 
     fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
         let (epoch, anchor_start, anchor_next, discriminant, profile, contents) = *data;
@@ -572,37 +572,36 @@ impl Header for QrBucket {
 /// Seal a routed [`QrIntake`] into a [`QrBucket`] that runs boundary to
 /// boundary.
 ///
-/// The intake's `anchor_prev` must be the epoch link of `anchor_final_prev`
-/// into `epoch`, and becomes the bucket's `anchor_start`. The step performs
-/// the boundary digest of the intake's `anchor_end` into `epoch + 1`, and
-/// emits that as the bucket's `anchor_next`.
+/// The intake's `anchor_prev` must be the boundary digest of
+/// `anchor_final_prev` into `epoch`. It becomes the bucket's `anchor_start`.
+/// The step computes the boundary digest of the intake's `anchor_end` into
+/// `epoch + 1`, and outputs it as the bucket's `anchor_next`.
 ///
-/// The intake covers `(anchor_prev, anchor_end]`, the stamp folds of `epoch`.
-/// The bucket covers `[anchor_start, anchor_next)`: the same folds plus the
-/// entry anchor, which belongs to `epoch` and absorbs no tachygrams. Both
-/// bucket bounds are epoch links, the only anchors that certify an epoch
-/// boundary.
+/// The intake covers stamp absorptions over `(anchor_prev, anchor_end]` within
+/// `epoch`. The bucket covers `[anchor_start, anchor_next)`. This range also
+/// contains `anchor_start`. `anchor_start` absorbs no tachygrams. Both bucket
+/// bounds are boundary digests.
 ///
 /// # Soundness
 ///
-/// Only an epoch link produces an anchor in the epoch domain, so an
-/// `anchor_prev` of this form absorbs `epoch`. Whether it is the *entry
-/// anchor* of `epoch` depends on what was published, and this step does not
-/// check it: `anchor_final_prev` is a free witness, and the lineage that
-/// consumes the bucket binds it. [`Anchor::default`] is epoch zero's
-/// entry anchor and follows this rule at an `anchor_final_prev` of zero.
+/// Only a boundary digest hashes under the epoch domain. The check shows that
+/// `anchor_prev` absorbs `epoch`. This step does not check whether
+/// `anchor_prev` is the published entry anchor of `epoch`. `anchor_final_prev`
+/// is a free witness. Consensus membership of the consuming lineage's spend
+/// anchor binds `anchor_final_prev`. [`Anchor::default`] is the entry anchor of
+/// epoch zero. It is the boundary digest of zero into epoch zero.
 ///
-/// The crossing is what makes the bucket's whole-epoch claim true. In the
-/// accepted chain, the only anchor of epoch-link form absorbing `epoch + 1` is
-/// the one folded from `final(epoch)`. This step emits
-/// `H_epoch(a, epoch + 1)` for the intake's own `a`, so if `a` is not
-/// `final(epoch)` the result is on no chain, and by preimage resistance
-/// neither is any fold downstream of it. A bucket sealed short of the epoch
-/// therefore yields evidence no lineage can carry to a consensus-checked spend.
-/// A final anchor cannot carry this guarantee: consensus acknowledges every
-/// end-of-block anchor, so a bucket ending on one could stop short.
+/// The crossing makes a bucket used in a consensus-accepted spend cover the
+/// whole epoch. In the accepted chain, the only boundary digest into
+/// `epoch + 1` is the one computed from `final(epoch)`. This step outputs
+/// `H_epoch(a, epoch + 1)` for the intake's own `a`. If `a` is not
+/// `final(epoch)`, the result is outside the accepted chain. A later fold can
+/// reach the accepted chain only by producing a Poseidon collision. A bucket
+/// sealed before the final anchor cannot support a spend that consensus
+/// accepts. Consensus acknowledges every end-of-block anchor. Membership of an
+/// end-of-block anchor does not establish whole-epoch coverage.
 ///
-/// `discriminant` is prover-chosen and unchecked here; see [`QrDiscriminant`].
+/// `discriminant` is prover-chosen and unchecked here. See [`QrDiscriminant`].
 #[derive(Debug)]
 pub struct QrBucketSeal;
 
@@ -614,7 +613,7 @@ impl Step for QrBucketSeal {
     /// `(anchor_final_prev)`
     type Witness<'source> = (Anchor,);
 
-    const INDEX: Index = Index::new(22);
+    const INDEX: Index = Index::new(20);
 
     fn witness<'source>(
         &self,
@@ -626,7 +625,7 @@ impl Step for QrBucketSeal {
         enforce_zero(
             Fp::from(anchor_prev)
                 - poseidon::anchor_next_epoch(Fp::from(anchor_final_prev), Fp::from(epoch)),
-            "QrBucketSeal: intake's first anchor is not an epoch link into its epoch",
+            "QrBucketSeal: witnessed boundary digest does not match intake's first anchor",
         )?;
         let epoch_next = epoch.next().ok_or_else(|| {
             ragu_core::Error::InvalidWitness("QrBucketSeal: crossing past the final epoch".into())
@@ -773,7 +772,7 @@ impl Step for QrUnspentInit {
         TachygramSetPoly,
     );
 
-    const INDEX: Index = Index::new(21);
+    const INDEX: Index = Index::new(19);
 
     fn witness<'source>(
         &self,
