@@ -186,7 +186,7 @@ impl Step for AnchorSpanSeed {
     /// `(anchor_start, epoch, stamp_commit)`
     type Witness<'source> = (Anchor, EpochIndex, TachygramSetCommit);
 
-    const INDEX: Index = Index::new(32);
+    const INDEX: Index = Index::new(31);
 
     fn witness<'source>(
         &self,
@@ -233,7 +233,7 @@ impl Step for AnchorSpanFuse {
     /// `(left_members, combined, right_members)`
     type Witness<'source> = (AnchorSetPoly, AnchorSetPoly, AnchorSetPoly);
 
-    const INDEX: Index = Index::new(33);
+    const INDEX: Index = Index::new(32);
 
     fn witness<'source>(
         &self,
