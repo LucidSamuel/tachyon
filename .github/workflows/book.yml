@@ -2,7 +2,7 @@ name: Book
 
 on:
   push:
-    branches: [main]
+    branches: [main, book-release]
   pull_request:
 
 permissions:
@@ -28,7 +28,10 @@ jobs:
   notify-website:
     name: Notify website to deploy
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # The website renders main at /_book (staging) and book-release at /book.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/book-release')
     runs-on: ubuntu-latest
     steps:
       - name: Trigger repository_dispatch in website
