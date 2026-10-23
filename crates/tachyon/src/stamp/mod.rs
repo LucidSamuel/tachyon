@@ -21,7 +21,10 @@ use group::{Curve as _, GroupEncoding as _};
 use pasta_curves::{Eq, Fp};
 use proof::{
     PROOF_SYSTEM, output,
-    stamp::{OutputStamp, SpendStamp, Stamp, StampLift, StampMerge},
+    stamp::{
+        ActionLift, ActionMerge, Actions, FeeFuse, FeeSeed, OutputAction, SpendAction, Stamp,
+        StampLift, StampMerge,
+    },
 };
 use ragu::PROOF_SIZE_COMPRESSED;
 use ragu_circuits::polynomials::{ProductionRank, Rank as _};
@@ -33,6 +36,7 @@ use crate::{
     digest::blake2b,
     effect,
     entropy::ActionEntropy,
+    fee,
     keys::{ProofAuthorizingKey, private},
     primitives::{
         ActionDigest, ActionDigestError, Anchor, AnchorSetPoly, Tachygram, TachygramSetCommit,
@@ -73,7 +77,18 @@ pub struct Unproven;
 ///
 /// The all-zero wtxid (which refers to no aggregate) is rejected.
 #[derive(Clone, Copy, Debug, Into, PartialEq, TotalEq)]
-pub struct PointerStamp([u8; 64]);
+pub struct AggregateId([u8; 64]);
+
+/// A pointer to the covering aggregate, and the fee of the bundle that
+/// carries this stamp.
+#[derive(Clone, Copy, Debug, PartialEq, TotalEq)]
+pub struct PointerStamp {
+    /// The covering aggregate's wtxid.
+    pub wtxid: AggregateId,
+
+    /// The fee of the bundle that carries this stamp.
+    pub fee: value::Positive,
+}
 
 #[derive(Clone, Copy, Debug, Display, Error)]
 /// Errors that can occur when handling an aggregate id.
@@ -83,7 +98,7 @@ pub enum AggregateIdError {
     Zero,
 }
 
-impl TryFrom<(&[u8; 32], &[u8; 32])> for PointerStamp {
+impl TryFrom<(&[u8; 32], &[u8; 32])> for AggregateId {
     type Error = AggregateIdError;
 
     fn try_from((sighash, auth_digest): (&[u8; 32], &[u8; 32])) -> Result<Self, Self::Error> {
@@ -94,7 +109,7 @@ impl TryFrom<(&[u8; 32], &[u8; 32])> for PointerStamp {
     }
 }
 
-impl TryFrom<[u8; 64]> for PointerStamp {
+impl TryFrom<[u8; 64]> for AggregateId {
     type Error = AggregateIdError;
 
     fn try_from(wtxid: [u8; 64]) -> Result<Self, Self::Error> {
@@ -108,11 +123,16 @@ impl TryFrom<[u8; 64]> for PointerStamp {
 /// Bundle states that carry a stamp: [`ProofStamp`] or [`PointerStamp`].
 /// The intermediate [`Unproven`] state has no stamp.
 pub trait StampState: BundleState {
-    /// A stamp's 64-byte `tachyonStampState`.
+    /// A stamp's 72-byte `tachyonStampState`.
     ///
-    /// For a [`ProofStamp`], this is a digest of the stamp data.
-    /// For a [`PointerStamp`], this is the wtxid directly.
-    fn stamp_digest(&self) -> [u8; 64];
+    /// For a [`ProofStamp`], this is
+    /// `LE64(vFeeTachyon) || hStampCoverageTachyon || hStampDataTachyon`.
+    /// For a [`PointerStamp`], this is `LE64(vFeeTachyon) ||
+    /// tachyonAggregateId`.
+    fn stamp_digest(&self) -> [u8; 72];
+
+    /// The fee of the bundle that carries this stamp.
+    fn fee(&self) -> value::Positive;
 
     /// The `tachyonBundleState` wire byte for this state.
     fn state_byte() -> StateByte
@@ -140,8 +160,16 @@ pub trait StampState: BundleState {
 }
 
 impl StampState for PointerStamp {
-    fn stamp_digest(&self) -> [u8; 64] {
-        self.0
+    fn stamp_digest(&self) -> [u8; 72] {
+        let mut stamp_digest = [0u8; 72];
+        stamp_digest[..8].copy_from_slice(&u64::from(self.fee).to_le_bytes());
+        stamp_digest[8..].copy_from_slice(&self.wtxid.0);
+
+        stamp_digest
+    }
+
+    fn fee(&self) -> value::Positive {
+        self.fee
     }
 
     fn state_byte() -> StateByte {
@@ -158,42 +186,54 @@ impl StampState for PointerStamp {
 }
 
 impl PointerStamp {
-    /// Read an aggregate id from the consensus wire format.
+    /// Read a fee and an aggregate id from the consensus wire format.
     ///
     /// # Errors
     ///
-    /// Returns an error if reading fails or the wtxid is all-zero, which
-    /// refers to no aggregate.
+    /// Returns an error if reading fails, the fee exceeds `MAX_MONEY`, or the
+    /// wtxid is all-zero, which refers to no aggregate.
     pub fn read<R: Read>(mut reader: R) -> io::Result<Self> {
+        let fee = {
+            let mut bytes = [0u8; size_of::<u64>()];
+            reader.read_exact(&mut bytes)?;
+            value::Positive::try_from(u64::from_le_bytes(bytes))
+                .map_err(|_err| io::Error::new(io::ErrorKind::InvalidData, "fee out of range"))
+        }?;
+
         let mut wtxid = [0u8; 64];
         reader.read_exact(&mut wtxid)?;
-        Self::try_from(wtxid).map_err(|_err| {
+        let aggregate = AggregateId::try_from(wtxid).map_err(|_err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "aggregate id is zero and refers to no aggregate",
             )
+        })?;
+        Ok(Self {
+            wtxid: aggregate,
+            fee,
         })
     }
 
-    /// Write an aggregate id to the consensus wire format.
+    /// Write a fee and an aggregate id to the consensus wire format.
     ///
     /// # Errors
     ///
     /// Returns an error if writing fails or the wtxid is all-zero, which
     /// refers to no aggregate.
     pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        if self.0 == [0u8; 64] {
+        if self.wtxid.0 == [0u8; 64] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "aggregate id is zero and refers to no aggregate",
             ));
         }
-        writer.write_all(&self.0)
+        writer.write_all(&u64::from(self.fee).to_le_bytes())?;
+        writer.write_all(&self.wtxid.0)
     }
 }
 
 impl StampState for ProofStamp {
-    fn stamp_digest(&self) -> [u8; 64] {
+    fn stamp_digest(&self) -> [u8; 72] {
         let stamp_data_digest: [u8; 32] = {
             let proof = self.proof.serialize();
             let anchor: [u8; 32] = self.anchor.0.into();
@@ -213,11 +253,16 @@ impl StampState for ProofStamp {
             )
         };
 
-        let mut stamp_digest = [0u8; 64];
-        stamp_digest[..32].copy_from_slice(&self.coverage);
-        stamp_digest[32..].copy_from_slice(&stamp_data_digest);
+        let mut stamp_digest = [0u8; 72];
+        stamp_digest[..8].copy_from_slice(&u64::from(self.fee).to_le_bytes());
+        stamp_digest[8..40].copy_from_slice(&self.coverage);
+        stamp_digest[40..].copy_from_slice(&stamp_data_digest);
 
         stamp_digest
+    }
+
+    fn fee(&self) -> value::Positive {
+        self.fee
     }
 
     fn state_byte() -> StateByte {
@@ -242,6 +287,13 @@ impl ProofStamp {
     /// Returns an error if reading fails or any component is not a canonical
     /// encoding.
     pub fn read<R: Read>(mut reader: R) -> io::Result<Self> {
+        let fee = {
+            let mut bytes = [0u8; size_of::<u64>()];
+            reader.read_exact(&mut bytes)?;
+            value::Positive::try_from(u64::from_le_bytes(bytes))
+                .map_err(|_err| io::Error::new(io::ErrorKind::InvalidData, "fee out of range"))
+        }?;
+
         let mut covered_actions = [0u8; 32];
         reader.read_exact(&mut covered_actions)?;
 
@@ -307,6 +359,7 @@ impl ProofStamp {
             tachygram_set,
             tachygrams,
             proof: Box::new(proof),
+            fee,
         })
     }
 
@@ -317,6 +370,7 @@ impl ProofStamp {
     ///
     /// Returns an error if writing fails.
     pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+        writer.write_all(&u64::from(self.fee).to_le_bytes())?;
         writer.write_all(&self.coverage)?;
         self.anchor.write(&mut writer)?;
         serialization::write_eq_affine(&mut writer, &self.tachygram_set.as_ref().to_affine())?;
@@ -338,13 +392,13 @@ impl ProofStamp {
 
 /// Everything needed to produce a [`ProofStamp`].
 ///
-/// The statement is each action's descriptor `(cv, rk)` and the `anchor`.
-/// The planned witnesses are each action's `theta` and `rcv`, and each
-/// output's `note`. A spend's note comes from its
-/// [`NoteSecret`](delegation::NoteSecret) PCD at
-/// [`prove`](Self::prove).
+/// The statement is each action's descriptor `(cv, rk)`, the fee descriptor,
+/// and the `anchor`. The planned witnesses are each action's `theta` and
+/// `rcv`, each output's `note`, and the max fee note with the `fee` it pays
+/// and the derived fee change note. A spend's note comes from its
+/// [`delegation::NoteSecret`] PCD at [`Self::prove`].
 ///
-/// Construct via [`Plan::new`], or via
+/// Construct via [`Plan::new`] or via
 /// [`Plan::stamp_plan`](crate::bundle::Plan::stamp_plan) for the typed
 /// single-party path.
 #[derive(Clone, Debug)]
@@ -352,20 +406,39 @@ pub struct Plan {
     spends: Vec<(action::Descriptor, ActionEntropy, value::Trapdoor)>,
     outputs: Vec<(action::Descriptor, ActionEntropy, Note, value::Trapdoor)>,
     anchor: Anchor,
+    max_fee_note: Note,
+    fee: value::Positive,
+    fee_change_note: Note,
 }
 
 impl Plan {
-    /// Create a stamp plan from paired action descriptors and witnesses.
+    /// Create a stamp plan from paired action descriptors and witnesses, the
+    /// max fee note and the fee. Derives and stores the fee change note.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fee exceeds the max fee note's value.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         spends: Vec<(action::Descriptor, ActionEntropy, value::Trapdoor)>,
         outputs: Vec<(action::Descriptor, ActionEntropy, Note, value::Trapdoor)>,
         anchor: Anchor,
+        max_fee_note: Note,
+        fee: value::Positive,
     ) -> Self {
+        #[expect(clippy::expect_used, reason = "the fee must not exceed the maximum")]
+        let fee_change_note = Note {
+            value: value::Positive::try_from(i128::from(max_fee_note.value) - i128::from(fee))
+                .expect("fee should not exceed max fee"),
+            ..max_fee_note
+        };
         Self {
             spends,
             outputs,
             anchor,
+            max_fee_note,
+            fee,
+            fee_change_note,
         }
     }
 
@@ -376,22 +449,28 @@ impl Plan {
     /// [`ProofStamp::prove_spend`] proves the action at the spendable's
     /// anchor. If that anchor differs from the plan's anchor, the spend comes
     /// with a list of [`AnchorSpan`](pool::AnchorSpan)s and their members
-    /// polynomials. [`StampLift`] moves the spend stamp along each span in
+    /// polynomials. [`ActionLift`] moves the spend's actions along each span in
     /// order. The first span must contain the spendable's anchor, each later
     /// span must contain the previous span's `anchor_end`, and the last span
     /// must end at the plan's anchor. For each **output**,
     /// [`ProofStamp::prove_output`] proves the action at the plan's anchor.
     ///
-    /// Stamps are recursively merged via [`StampMerge`] into a single stamp,
-    /// whose coverage is the planned descriptors.
+    /// The planned actions are recursively merged via [`ActionMerge`] into a
+    /// single proof, whose coverage is the planned descriptors. [`FeeFuse`]
+    /// then applies the fee, or [`FeeSeed`] proves it for a plan with no
+    /// actions.
     ///
     /// # Errors
     ///
-    /// - [`ProveError::MissingPcd`] if the plan has no actions, the spend PCDs
-    ///   do not match the planned spends, or a spend does not reach the plan's
-    ///   anchor.
+    /// - [`ProveError::MissingPcd`] if the spend PCDs do not match the planned
+    ///   spends, or a spend does not reach the plan's anchor.
     /// - [`ProveError::ActionDigest`] if a proved action has no digest.
     /// - [`ProveError::ProofFailed`] if a proof-system step fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the max fee note's `rcm` is zero, or if the plan has no
+    /// actions and the max fee note's value is nonzero.
     #[expect(
         clippy::type_complexity,
         reason = "each spend's secret, spendable and anchor spans"
@@ -410,6 +489,15 @@ impl Plan {
             Vec<(ragu::Pcd<pool::AnchorSpan>, AnchorSetPoly)>,
         )>,
     ) -> Result<ProofStamp, ProveError> {
+        let fee_descriptor = fee::Descriptor {
+            max_commitment: self
+                .max_fee_note
+                .fee_blind()
+                .commit(-self.max_fee_note.value),
+            value: self.fee,
+        };
+        let change = Tachygram::from(self.fee_change_note.commitment());
+
         // Each entry pairs leaf stamp components with the descriptor of its
         // covered action; merges concatenate both. The covered-actions digest
         // is computed once, on the final stamp.
@@ -446,7 +534,7 @@ impl Plan {
 
             let (digests, tachygrams, spend_anchor, spend_proof) =
                 ProofStamp::prove_spend(rng, theta, bind_pcd, *pak)?;
-            let mut stamp_pcd = spend_proof.carry::<Stamp>((
+            let mut stamp_pcd = spend_proof.carry::<Actions>((
                 digests.iter().copied().collect::<ActionSetPoly>().commit(),
                 tachygrams
                     .iter()
@@ -457,7 +545,7 @@ impl Plan {
             ));
             for (span, members) in spans {
                 stamp_pcd = PROOF_SYSTEM
-                    .fuse(rng, StampLift, (members,), stamp_pcd, span)
+                    .fuse(rng, ActionLift, (members,), stamp_pcd, span)
                     .map_err(ProveError::ProofFailed)?
                     .0;
             }
@@ -484,7 +572,7 @@ impl Plan {
             ));
         }
 
-        let (descriptors, digests, tachygrams, anchor, merged_proof) = entries
+        let (pcd, descriptors, mut tachygrams) = match entries
             .into_iter()
             .map(Ok)
             .reduce(|acc, next| {
@@ -492,11 +580,51 @@ impl Plan {
                 let (right_desc, right_digests, right_tachygrams, right_anchor, right_proof) =
                     next?;
 
-                let (merged_digests, merged_tachygrams, merged_anchor, merged_proof) =
-                    ProofStamp::prove_merge(
+                let (left_acts_poly, left_tg_poly) = (
+                    left_digests.iter().copied().collect::<ActionSetPoly>(),
+                    left_tachygrams
+                        .iter()
+                        .copied()
+                        .collect::<TachygramSetPoly>(),
+                );
+                let (right_acts_poly, right_tg_poly) = (
+                    right_digests.iter().copied().collect::<ActionSetPoly>(),
+                    right_tachygrams
+                        .iter()
+                        .copied()
+                        .collect::<TachygramSetPoly>(),
+                );
+
+                let left_pcd = left_proof.carry::<Actions>((
+                    left_acts_poly.commit(),
+                    left_tg_poly.commit(),
+                    left_anchor,
+                ));
+                let right_pcd = right_proof.carry::<Actions>((
+                    right_acts_poly.commit(),
+                    right_tg_poly.commit(),
+                    right_anchor,
+                ));
+
+                let merged_digests: BTreeSet<ActionDigest> =
+                    left_digests.union(&right_digests).copied().collect();
+                let merged_tachygrams: BTreeSet<Tachygram> =
+                    left_tachygrams.union(&right_tachygrams).copied().collect();
+
+                let (pcd, ()) = PROOF_SYSTEM
+                    .fuse(
                         rng,
-                        (left_digests, left_tachygrams, left_anchor, left_proof),
-                        (right_digests, right_tachygrams, right_anchor, right_proof),
+                        ActionMerge,
+                        (
+                            (left_acts_poly, left_tg_poly),
+                            (
+                                ActionSetPoly::from_iter(merged_digests.clone()),
+                                TachygramSetPoly::from_iter(merged_tachygrams.clone()),
+                            ),
+                            (right_acts_poly, right_tg_poly),
+                        ),
+                        left_pcd,
+                        right_pcd,
                     )
                     .map_err(ProveError::ProofFailed)?;
 
@@ -506,37 +634,66 @@ impl Plan {
                     merged_descs,
                     merged_digests,
                     merged_tachygrams,
-                    merged_anchor,
-                    merged_proof,
+                    pcd.data().2,
+                    Box::new(pcd.proof().clone()),
                 ))
             })
             .transpose()?
-            .ok_or(ProveError::MissingPcd(
-                "no proof for no planned actions".into(),
-            ))?;
+        {
+            None => {
+                let (pcd, ()) = PROOF_SYSTEM
+                    .seed(
+                        rng,
+                        FeeSeed,
+                        witness::fee_seed(((), ()), self.max_fee_note, self.anchor),
+                    )
+                    .map_err(ProveError::ProofFailed)?;
+                (pcd, BTreeSet::new(), BTreeSet::new())
+            },
+            Some((descriptors, digests, tachygrams, anchor, merged_proof)) => {
+                let stamp_header = (
+                    digests.iter().copied().collect::<ActionSetPoly>().commit(),
+                    tachygrams
+                        .iter()
+                        .copied()
+                        .collect::<TachygramSetPoly>()
+                        .commit(),
+                    anchor,
+                );
+                let (pcd, ()) = PROOF_SYSTEM
+                    .fuse(
+                        rng,
+                        FeeFuse,
+                        witness::fee_fuse(
+                            (stamp_header, ()),
+                            self.max_fee_note,
+                            self.fee,
+                            &digests,
+                            &tachygrams,
+                        ),
+                        merged_proof.carry::<Actions>(stamp_header),
+                        ragu::Proof::trivial().carry::<()>(()),
+                    )
+                    .map_err(ProveError::ProofFailed)?;
+                (pcd, descriptors, tachygrams)
+            },
+        };
 
-        let coverage = blake2b::action_descriptor_digest(&Vec::<[u8; 64]>::from_iter(descriptors));
-        let tachygram_set = tachygrams
-            .iter()
-            .copied()
-            .collect::<TachygramSetPoly>()
-            .commit();
-        let action_set = digests.into_iter().collect::<ActionSetPoly>().commit();
-        let proof = PROOF_SYSTEM
-            .rerandomize(
-                merged_proof.carry::<Stamp>((action_set, tachygram_set, anchor)),
-                rng,
-            )
+        let (proof, (_, tachygram_set, anchor)) = PROOF_SYSTEM
+            .rerandomize(pcd, rng)
             .map_err(ProveError::ProofFailed)?
-            .proof()
-            .clone();
-
+            .into_parts();
+        tachygrams.insert(change);
         Ok(ProofStamp {
-            coverage,
+            coverage: blake2b::stamp_coverage_digest(
+                &blake2b::action_descriptor_digest(&Vec::<[u8; 64]>::from_iter(descriptors)),
+                &blake2b::stamp_fees_digest(&[fee_descriptor.into()]),
+            ),
             anchor,
             tachygram_set,
             tachygrams,
             proof: Box::new(proof),
+            fee: self.fee,
         })
     }
 }
@@ -563,10 +720,11 @@ pub enum ProveError {
 /// reconstruct the header from public data.
 #[derive(Clone, Debug)]
 pub struct ProofStamp {
-    /// The digest $\mathsf{hStampActionsTachyon}$ of the proof's covered action
-    /// descriptors from this stamp's bundle and all covered bundles.
+    /// The digest $\mathsf{hStampCoverageTachyon}$ of the proof's covered
+    /// action descriptors and fee descriptors from this stamp's bundle and
+    /// all covered bundles.
     ///
-    /// See [`blake2b::action_descriptor_digest`]
+    /// See [`blake2b::stamp_coverage_digest`]
     pub coverage: [u8; 32],
 
     /// The historic pool state for which this stamp is valid.
@@ -583,13 +741,16 @@ pub struct ProofStamp {
     /// The Ragu proof bytes.
     #[debug(skip)]
     pub proof: Box<ragu::Proof>,
+
+    /// The fee of the bundle that carries this stamp.
+    pub fee: value::Positive,
 }
 
 impl ProofStamp {
     /// Proves a single output action, returning `(digests, tachygrams,
     /// anchor, proof)`. The proof is not rerandomized.
     ///
-    /// [`output::OutputBind`] settles the tachygram pair, then [`OutputStamp`]
+    /// [`output::OutputBind`] settles the tachygram pair, then [`OutputAction`]
     /// derives `alpha` from `theta` and the bound `cm`, proves the action over
     /// the pair, and enforces the stamp accumulator. Both tachygrams
     /// are derived inside the circuit and placed on the stamp for data
@@ -634,8 +795,8 @@ impl ProofStamp {
         let (pcd, ()) = PROOF_SYSTEM
             .fuse(
                 rng,
-                OutputStamp,
-                witness::output_stamp((*bind_pcd.data(), ()), theta, anchor),
+                OutputAction,
+                witness::output_action((*bind_pcd.data(), ()), theta, anchor),
                 bind_pcd,
                 ragu::Proof::trivial().carry::<()>(()),
             )
@@ -656,7 +817,7 @@ impl ProofStamp {
     /// The nullifier pair `{nf_current, nf_next}` published for data
     /// availability and the value commitment `cv` are read straight off the
     /// bind header (both derived at [`SpendBind`](spend::SpendBind)).
-    /// [`SpendStamp`] derives `alpha` from `theta` and the bound `cm`, proves
+    /// [`SpendAction`] derives `alpha` from `theta` and the bound `cm`, proves
     /// the action `(cv, rk)`, and enforces the stamp accumulator over the
     /// pair. The spend's `anchor` is taken as the stamp's anchor; chain
     /// validation lives inside the spendable lineage. `digests` holds the
@@ -695,8 +856,8 @@ impl ProofStamp {
         let (pcd, ()) = PROOF_SYSTEM
             .fuse(
                 rng,
-                SpendStamp,
-                witness::spend_stamp((*bind_pcd.data(), ()), theta, pak),
+                SpendAction,
+                witness::spend_action((*bind_pcd.data(), ()), theta, pak),
                 bind_pcd,
                 ragu::Proof::trivial().carry::<()>(()),
             )
@@ -816,7 +977,7 @@ impl ProofStamp {
     ///
     /// - [`ProveError::MissingPcd`] if no span is provided.
     /// - [`ProveError::ProofFailed`] if a proof-system step fails.
-    pub fn prove_lift<RNG: CryptoRng>(
+    fn prove_lift<RNG: CryptoRng>(
         self,
         rng: &mut RNG,
         action_digests: impl IntoIterator<Item = ActionDigest>,
@@ -851,11 +1012,12 @@ impl ProofStamp {
             tachygram_set: self.tachygram_set,
             tachygrams: self.tachygrams,
             proof: Box::new(proof),
+            fee: self.fee,
         })
     }
 
     /// Advances the stamp's anchor along `spans`, computing the action digests
-    /// from the covered descriptors.
+    /// from the covered descriptors. The lifted stamp keeps this stamp's fee.
     ///
     /// # Errors
     ///
@@ -865,11 +1027,13 @@ impl ProofStamp {
         self,
         rng: &mut RNG,
         descriptors: &BTreeSet<action::Descriptor>,
+        fee_descriptors: &BTreeSet<fee::Descriptor>,
         spans: Vec<(ragu::Pcd<pool::AnchorSpan>, AnchorSetPoly)>,
     ) -> Result<Self, ProveError> {
         let action_digests = descriptors
             .iter()
             .map(action::Descriptor::digest)
+            .chain(fee_descriptors.iter().map(fee::Descriptor::digest))
             .collect::<Result<BTreeSet<ActionDigest>, ActionDigestError>>()
             .map_err(ProveError::ActionDigest)?;
 
@@ -878,9 +1042,12 @@ impl ProofStamp {
 
     /// Merges two stamps into one covering stamp.
     ///
-    /// Each side pairs a stamp with the descriptors of its covered actions.
+    /// Each side pairs a stamp with its covered action and fee descriptors.
     /// The action digests for the merge proof and the merged
     /// `covered_actions` are both derived from the descriptor lists.
+    ///
+    /// The merged stamp stays with this stamp's bundle and keeps this stamp's
+    /// fee, and the other stamp's bundle is stripped.
     ///
     /// TODO: confirm desc list against stamp? it's forbidden by the proof
     /// system, but we might want to fail early.
@@ -890,18 +1057,25 @@ impl ProofStamp {
     /// Returns [`ProveError`] if an action digest cannot be computed or a
     /// proof-system step fails.
     pub fn merge<RNG: CryptoRng>(
+        self,
         rng: &mut RNG,
-        (left_stamp, left_desc): (Self, BTreeSet<action::Descriptor>),
-        (right_stamp, right_desc): (Self, BTreeSet<action::Descriptor>),
+        (left_desc, left_fees): (BTreeSet<action::Descriptor>, BTreeSet<fee::Descriptor>),
+        (right_stamp, right_desc, right_fees): (
+            Self,
+            BTreeSet<action::Descriptor>,
+            BTreeSet<fee::Descriptor>,
+        ),
     ) -> Result<Self, ProveError> {
         let left_actions_digest = left_desc
             .iter()
             .map(action::Descriptor::digest)
+            .chain(left_fees.iter().map(fee::Descriptor::digest))
             .collect::<Result<BTreeSet<ActionDigest>, ActionDigestError>>()
             .map_err(ProveError::ActionDigest)?;
         let right_actions_digest = right_desc
             .iter()
             .map(action::Descriptor::digest)
+            .chain(right_fees.iter().map(fee::Descriptor::digest))
             .collect::<Result<BTreeSet<ActionDigest>, ActionDigestError>>()
             .map_err(ProveError::ActionDigest)?;
 
@@ -909,9 +1083,9 @@ impl ProofStamp {
             rng,
             (
                 left_actions_digest,
-                left_stamp.tachygrams,
-                left_stamp.anchor,
-                left_stamp.proof,
+                self.tachygrams,
+                self.anchor,
+                self.proof,
             ),
             (
                 right_actions_digest,
@@ -922,11 +1096,20 @@ impl ProofStamp {
         )
         .map_err(ProveError::ProofFailed)?;
 
-        let coverage = blake2b::action_descriptor_digest(
-            &left_desc
-                .union(&right_desc)
-                .copied()
-                .collect::<Vec<[u8; 64]>>(),
+        let coverage = blake2b::stamp_coverage_digest(
+            &blake2b::action_descriptor_digest(
+                &left_desc
+                    .union(&right_desc)
+                    .copied()
+                    .collect::<Vec<[u8; 64]>>(),
+            ),
+            &blake2b::stamp_fees_digest(
+                &left_fees
+                    .union(&right_fees)
+                    .copied()
+                    .map(<[u8; 40]>::from)
+                    .collect::<Vec<[u8; 40]>>(),
+            ),
         );
 
         let tachygram_set = tachygrams
@@ -953,20 +1136,34 @@ impl ProofStamp {
             tachygram_set,
             tachygrams,
             proof: Box::new(proof),
+            fee: self.fee,
         })
     }
 
-    /// Confirm `hStampActionsTachyon` represents the given action descriptors.
+    /// Confirm `hStampCoverageTachyon` represents the given descriptors.
     ///
     /// # Soundness
     ///
-    /// The parameter is a multiset: order does not matter, multiplicity does.
+    /// The parameters are multisets: order does not matter, multiplicity does.
     #[must_use]
-    pub fn is_covering(&self, action_descs: impl IntoIterator<Item = action::Descriptor>) -> bool {
+    pub fn is_covering(
+        &self,
+        action_descs: impl IntoIterator<Item = action::Descriptor>,
+        fee_descriptors: impl IntoIterator<Item = fee::Descriptor>,
+    ) -> bool {
         let mut desc_bytes = action_descs.into_iter().collect::<Vec<[u8; 64]>>();
         desc_bytes.sort_unstable();
 
-        self.coverage == blake2b::action_descriptor_digest(&desc_bytes)
+        let mut fee_descriptor_bytes = fee_descriptors
+            .into_iter()
+            .map(<[u8; 40]>::from)
+            .collect::<Vec<[u8; 40]>>();
+        fee_descriptor_bytes.sort_unstable();
+        self.coverage
+            == blake2b::stamp_coverage_digest(
+                &blake2b::action_descriptor_digest(&desc_bytes),
+                &blake2b::stamp_fees_digest(&fee_descriptor_bytes),
+            )
     }
 
     /// Reconstruct the PCD header and verify the proof. Call

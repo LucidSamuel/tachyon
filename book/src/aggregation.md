@@ -32,6 +32,7 @@ Aggregates may be further named:
   For example, a miner's coin*base* transaction might be an aggregate, and also output miner rewards via Tachyon action.
 
 When stripped, an innocent contributes no actions but still names a covering transaction: its `tachyonAggregateId` is a nonzero reference to the aggregate that absorbed its stamp, never the all-zero `wtxid`.
+It retains its fee descriptor and binding signature.
 
 [^bundle-format]: See [Bundles](./bundle.md) to understand bundle format.
 
@@ -50,8 +51,11 @@ Aggregators collect autonomes or existing aggregates and merge their stamps:
 4. Merge stamps
    - Merge tachygrams (exclusive sets)
    - Merge proofs
-5. Serialize and compress the merged stamp
-6. Publish aggregate transaction
+5. For an innocent aggregate, prove its own zero fee with `FeeSeed` and merge the others' stamps into it
+6. Serialize and compress the merged stamp
+7. Publish aggregate transaction
+
+An innocent aggregate is a bundle with its own [max fee note](./fee.md#max-fee-note), so its stamp covers its own fee descriptor as well as the adjuncts'. Its stamp comes from an empty `Plan::prove`, which runs `FeeSeed`, and then absorbs the adjuncts' stamps with `ProofStamp::merge`.
 
 <!-- TODO
 - Explain tachygram set union validation algorithm
@@ -139,11 +143,13 @@ flowchart LR
 
 An aggregate's stamp proves its own actions together with every covered adjunct's actions, but carries no proof header: a verifier reconstructs the header from the covered actions. Within a block that material is all at hand, since each adjunct points to its aggregate by `wtxid`. Before block inclusion it is not: aggregators publish only their merged transactions, and the ambiguity between actions and tachygrams makes a nearly-complete collection of adjuncts hard to recognize without falling back on full proof verification.
 
-To make that recognition cheap, the stamp trailer carries `hStampActionsTachyon`, an assistive indicator the transaction author provides (see [Bundles → Wire Format](./bundle.md#stamp-trailer)). It is a BLAKE2b-256 digest over the sorted `cv || rk` descriptors of every action the stamp covers, so an observer can cheaply tell an autonome from an aggregate and judge whether a collection of adjuncts is complete, without verifying the proof. The proof binds the same actions as a Pedersen commitment to their Poseidon digests; recomputing the trailer digest is the cheap check, and it is a separate construction over the same set rather than a copy of the one the proof carries.
+To make that recognition cheap, the stamp trailer carries `hStampCoverageTachyon`, an assistive indicator the transaction author provides (see [Bundles → Wire Format](./bundle.md#stamp-trailer)). It is a BLAKE2b-256 digest of two sub-digests: `hStampActionsTachyon` over the sorted `cv || rk` descriptors of every action the stamp covers, and `hStampFeesTachyon` over the sorted `cv_maxfee || LE64(fee)` of every [fee descriptor](./fee.md) it covers. With it, an observer can cheaply tell an autonome from an aggregate and judge whether a collection of adjuncts is complete, without verifying the proof. The proof binds the same actions and fee descriptors as a Pedersen commitment to their Poseidon digests; recomputing the trailer digest is the cheap check, and it is a separate construction over the same set rather than a copy of the one the proof carries.
+
+A stripped adjunct keeps its fee descriptor: `cvFeeMaxTachyon` in the bundle body and `vFeeTachyon` in the stripped trailer. The covering verifier collects every covered fee descriptor from the published bundles.
 
 The indicator is authorization data, not effecting data: it rides on the strippable stamp trailer, contributes to `auth_digest`, and is absent from adjuncts. It is not a soundness mechanism. The proof binds the action set regardless; a wrong indicator only harms its author, since mempool actors decline to handle a transaction whose indicator they cannot satisfy, and a subset, superset, or partial overlap simply fails to validate.
 
-Coverage verification uses it as the first of two fast-fail gates. It recomputes the digest over the candidate collection's actions and, on disagreement with the carried `hStampActionsTachyon`, fails before attempting the expensive proof verification. It then checks the tachygram arity, `nTachygrams == 2 * covered actions`, which the fixed per-action ratio makes an exact test: a stamp short of the arity has reused a tachygram across actions, since the published tachygrams are a set.
+Coverage verification uses it as the first of two fast-fail gates. It recomputes the digest over the candidate collection's action descriptors and fee descriptors and, on disagreement with the carried `hStampCoverageTachyon`, fails before attempting the expensive proof verification. It then checks the tachygram arity, `nTachygrams == 2 * covered actions + covered bundles`, which the fixed ratios make an exact test: a stamp short of the arity has reused a tachygram, since the published tachygrams are a set.
 
 <!-- TODO
 p2p aggregation gossip is a secondary objective and aggregation has some complex constraints.

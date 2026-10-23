@@ -38,13 +38,17 @@
 //! | Name                  | Format               | Description                              |
 //! | --------------------- | -------------------- | ---------------------------------------- |
 //! | `tachyonBundleState`  | u8                   | `0x01` or `0x02`                         |
-//! | `valueBalanceTachyon` | i64                  | net value of tachyon actions             |
+//! | `valueBalanceTachyon` | i64                  | net value of tachyon actions and max fee |
 //! | `nActionsTachyon`     | compactsize          | number of tachyon actions                |
 //! | `vActionsTachyon`     | 64 * nActionsTachyon | (cv: 32 bytes, rk: 32 bytes)             |
+//! | `cvFeeMaxTachyon`     | 32 bytes             | max fee note value commitment            |
 //! | `vActionSigsTachyon`  | 64 * nActionsTachyon | authorization per action over tx sighash |
 //! | `bindingSigTachyon`   | 64 bytes             | binding over tx sighash                  |
 //! | `nMemoTachyon`        | compactsize          | memo length, `0` when absent             |
 //! | `vMemoTachyon`        | nMemoTachyon bytes   | opaque recipient-directed payload        |
+//!
+//! `cvFeeMaxTachyon` is a canonical non-identity point. The bundle
+//! contributes `valueBalanceTachyon + vFeeTachyon` to the transaction balance.
 //!
 //! The memo is effecting data, so it is covered by the transaction sighash
 //! rather than by `auth_digest`. Its length is public, and `nMemoTachyon == 0`
@@ -56,14 +60,15 @@
 //!
 //! When `tachyonBundleState == 1`, the bundle carries a proof stamp.
 //!
-//! | Name                   | Format               | Description                              |
-//! | ---------------------- | -------------------- | ---------------------------------------- |
-//! | `hStampActionsTachyon` | 32 bytes             | BLAKE2b digest of the covered actions    |
-//! | `anchorTachyon`        | 32 bytes             | pool state reference                     |
-//! | `cTachygrams`          | 32 bytes             | commitment to the tachygrams below       |
-//! | `nTachygrams`          | compactsize          | number of tachygrams                     |
-//! | `vTachygrams`          | 32 * nTachygrams     | tachygrams for this proof                |
-//! | `proofTachyon`         | PROOF_SIZE blob      | serialized proof of fixed size           |
+//! | Name                    | Format               | Description                                |
+//! | ----------------------- | -------------------- | ------------------------------------------ |
+//! | `vFeeTachyon`           | LE64                 | fee, at most `MAX_MONEY`                   |
+//! | `hStampCoverageTachyon` | 32 bytes             | BLAKE2b digest of covered actions and fees |
+//! | `anchorTachyon`         | 32 bytes             | pool state reference                       |
+//! | `cTachygrams`           | 32 bytes             | commitment to the tachygrams below         |
+//! | `nTachygrams`           | compactsize          | number of tachygrams                       |
+//! | `vTachygrams`           | 32 * nTachygrams     | tachygrams for this proof                  |
+//! | `proofTachyon`          | PROOF_SIZE blob      | serialized proof of fixed size             |
 //!
 //! `cTachygrams` is carried rather than derived, so full validation must
 //! confirm it against `vTachygrams`. Anchor advancement then reads the point
@@ -75,32 +80,36 @@
 //!
 //! | Name                  | Format               | Description                              |
 //! | --------------------- | -------------------- | ---------------------------------------- |
+//! | `vFeeTachyon`         | LE64                 | fee, at most `MAX_MONEY`                 |
 //! | `tachyonAggregateId`  | 64 bytes             | wtxid of the relevant aggregate          |
 //!
 //! The transaction `auth_digest` contribution commits either stamp as a
-//! 64-byte value: the pointer stamp's `wtxid` directly, or
-//! `hStampActionsTachyon || stamp_data_digest` for a proof stamp.
+//! 72-byte value led by the fee: a proof stamp as
+//! `LE64(vFeeTachyon) || hStampCoverageTachyon || hStampDataTachyon`, and a
+//! pointer stamp as `LE64(vFeeTachyon) || tachyonAggregateId`.
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
-use core::{cmp::Ordering, ops::Neg as _};
+use core::{cmp::Ordering, iter, ops::Neg as _};
 
 use corez::io::{self, Read, Write};
 use derive_more::{Debug, Display, Eq as TotalEq, Error, From, IsVariant, PartialEq, TryInto};
+use group::CurveAffine as _;
 use rand_core::CryptoRng;
 
 use crate::{
-    ActionDigest, ActionDigestError, TachygramSetCommit, TachygramSetPoly,
+    ActionDigest, ActionDigestError, Note, TachygramSetCommit, TachygramSetPoly,
     action::{self, Action},
     digest::blake2b,
+    fee,
     keys::{private, public},
     primitives::{Anchor, AnchorSetPoly, effect},
     reddsa, serialization,
     stamp::{
-        self, AggregateIdError, PointerStamp, ProofStamp, ProveError, StampState, Unproven,
-        proof::pool,
+        self, AggregateId, AggregateIdError, PointerStamp, ProofStamp, ProveError, StampState,
+        Unproven, proof::pool,
     },
     value,
 };
@@ -162,11 +171,14 @@ impl<T: sealed::Sealed> BundleState for T {}
 /// A Tachyon transaction bundle parameterized by bundle state `S`.
 #[derive(Clone, Debug)]
 pub struct Bundle<S: BundleState + ?Sized> {
-    /// Net value of spends minus outputs (plaintext integer).
+    /// Net value of spends minus outputs and max fee.
     pub value_balance: value::Balance,
 
     /// Actions (cv, rk, sig).
     pub actions: Vec<Action>,
+
+    /// The max fee note's value commitment.
+    pub fee_max_commitment: value::Commitment,
 
     /// Binding signature over the transaction sighash.
     pub binding_sig: Signature,
@@ -195,12 +207,26 @@ impl<S: BundleState + ?Sized> Bundle<S> {
         self.actions.iter().map(Action::descriptor)
     }
 
+    /// The bundle's fee descriptor.
+    #[must_use]
+    pub fn fee_descriptor(&self) -> fee::Descriptor
+    where
+        S: StampState,
+    {
+        fee::Descriptor {
+            max_commitment: self.fee_max_commitment,
+            value: self.stamp.fee(),
+        }
+    }
+
     /// Digest the bundle's effecting data.
     ///
-    /// This contributes to the transaction sighash. The stamp is excluded
-    /// because it is considered authorizing data, and is malleable during
-    /// aggregation. The memo is included, so a miner cannot strip the payload
-    /// and leave the block committing to the same transaction.
+    /// This contributes to the transaction sighash. The stamp and the fee are
+    /// excluded because they are considered authorizing data, and are malleable
+    /// during aggregation. The max fee note's value commitment is included,
+    /// fixing the maximum fee and the fee change note's owner. The memo is
+    /// included, so a miner cannot strip the payload and leave the block
+    /// committing to the same transaction.
     ///
     /// The digest binds actions in wire order and is therefore sensitive to
     /// their ordering.
@@ -210,6 +236,7 @@ impl<S: BundleState + ?Sized> Bundle<S> {
         blake2b::bundle_commitment(
             &blake2b::action_descriptor_digest(&descriptors),
             self.value_balance.into(),
+            &self.fee_max_commitment.into(),
             &blake2b::memo_digest(&self.memo),
         )
     }
@@ -222,7 +249,13 @@ impl<S: BundleState + ?Sized> Bundle<S> {
     /// or if any action signature does not verify under its own `rk`.
     pub fn verify_signatures(&self, sighash: &[u8; 32]) -> Result<(), SignatureError> {
         // 1. Derive bvk from public data
-        let bvk = public::BindingVerificationKey::derive(&self.actions, self.value_balance);
+        let bvk = public::BindingVerificationKey::derive(
+            self.actions
+                .iter()
+                .map(|action| action.cv)
+                .chain([self.fee_max_commitment]),
+            self.value_balance,
+        );
 
         // 2. Verify binding signature
         bvk.verify(sighash, &self.binding_sig)
@@ -259,8 +292,11 @@ pub enum VerifyCoverageError {
     /// The actions are not unique.
     #[display("actions are not unique")]
     DuplicateActions,
-    /// The stamp on this bundle does not claim to cover these actions.
-    #[display("stamp on this bundle does not claim to cover these actions")]
+    /// The fees are not unique.
+    #[display("fees are not unique")]
+    DuplicateFees,
+    /// The stamp on this bundle does not claim to cover these actions and fees.
+    #[display("stamp on this bundle does not claim to cover these actions and fees")]
     StampActionsMismatch,
 }
 
@@ -268,8 +304,9 @@ pub enum VerifyCoverageError {
 #[derive(Clone, Copy, Debug, Display, Error)]
 #[non_exhaustive]
 pub enum VerifyTachygramsError {
-    /// The stamp publishes a number of tachygrams other than two per action.
-    #[display("stamp does not publish two tachygrams per covered action")]
+    /// The stamp publishes a number of tachygrams other than two per action
+    /// and one per fee descriptor.
+    #[display("stamp does not publish two tachygrams per action and one per fee")]
     WrongArity,
     /// The stamp's tachygrams do not reproduce the stamp's set commitment.
     #[display("tachygrams do not reproduce the set commitment")]
@@ -336,20 +373,26 @@ pub struct Plan {
     /// Output action plans.
     outputs: Vec<action::Plan<effect::Output>>,
 
+    /// Max fee note.
+    max_fee_note: Note,
+
     /// Opaque recipient-directed payload, empty when absent.
     memo: Vec<u8>,
 }
 
 impl Plan {
-    /// Create a new bundle plan from assembled action plans, carrying no memo.
+    /// Create a new bundle plan from assembled action plans and a max fee note,
+    /// carrying no memo.
     #[must_use]
     pub const fn new(
         spends: Vec<action::Plan<effect::Spend>>,
         outputs: Vec<action::Plan<effect::Output>>,
+        max_fee_note: Note,
     ) -> Self {
         Self {
             spends,
             outputs,
+            max_fee_note,
             memo: Vec::new(),
         }
     }
@@ -390,7 +433,9 @@ impl Plan {
     /// Derive `value_balance` from note values.
     ///
     /// $$
-    ///   \sum_i v_{\text{spend},i} - \sum_j v_{\text{output},j}
+    ///   (\sum_i v_{\text{spend},i}) -
+    ///   (\sum_j v_{\text{output},j}) -
+    ///   v_\text{maxfee}
     /// $$
     ///
     /// # Errors
@@ -403,6 +448,7 @@ impl Plan {
                 |plan| i128::from(plan.note.value),
                 |plan| i128::from(plan.note.value).neg(),
             )
+            .chain([i128::from(self.max_fee_note.value).neg()])
             .sum::<i128>(),
         )
     }
@@ -418,16 +464,26 @@ impl Plan {
         Ok(blake2b::bundle_commitment(
             &blake2b::action_descriptor_digest(&desc_bytes),
             self.value_balance()?.into(),
+            &self
+                .max_fee_note
+                .fee_blind()
+                .commit(-self.max_fee_note.value)
+                .into(),
             &blake2b::memo_digest(&self.memo),
         ))
     }
 
     /// Build a [`stamp::Plan`] from this bundle plan.
     ///
-    /// Collects each action's descriptor and proof witnesses. The returned
-    /// plan is ready to prove with [`stamp::Plan::prove`].
+    /// Collects each action's descriptor and proof witnesses, and the max fee
+    /// note with `fee`. The returned plan is ready to prove with
+    /// [`stamp::Plan::prove`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `fee` exceeds the max fee note's value.
     #[must_use]
-    pub fn stamp_plan(&self, anchor: Anchor) -> stamp::Plan {
+    pub fn stamp_plan(&self, anchor: Anchor, fee: value::Positive) -> stamp::Plan {
         let spends = self
             .spends
             .iter()
@@ -440,16 +496,19 @@ impl Plan {
             .map(|plan| (plan.descriptor(), plan.theta, plan.note, plan.rcv))
             .collect();
 
-        stamp::Plan::new(spends, outputs, anchor)
+        stamp::Plan::new(spends, outputs, anchor, self.max_fee_note, fee)
     }
 
     /// Derive the binding signing key, which is the scalar sum of value
-    /// commitment trapdoors.
+    /// commitment trapdoors, including the max fee note's blind $r$.
     ///
-    /// $\mathsf{bsk} = \boxplus_i \mathsf{rcv}_i$.
+    /// $\mathsf{bsk} = \boxplus_i \mathsf{rcv}_i \boxplus r$.
     #[must_use]
     pub fn derive_bsk_private(&self) -> private::BindingSigningKey {
-        private::BindingSigningKey::from(self.iter_actions(|plan| plan.rcv, |plan| plan.rcv))
+        private::BindingSigningKey::from(
+            self.iter_actions(|plan| plan.rcv, |plan| plan.rcv)
+                .chain([self.max_fee_note.fee_blind()]),
+        )
     }
 
     /// Sign actions with the provided [`private::SpendAuthorizingKey`] and then
@@ -520,6 +579,10 @@ impl Plan {
         Ok(Bundle {
             actions,
             value_balance,
+            fee_max_commitment: self
+                .max_fee_note
+                .fee_blind()
+                .commit(-self.max_fee_note.value),
             binding_sig,
             memo: self.memo.clone(),
             stamp: Unproven,
@@ -534,6 +597,7 @@ impl Bundle<Unproven> {
         Bundle {
             actions: self.actions,
             value_balance: self.value_balance,
+            fee_max_commitment: self.fee_max_commitment,
             binding_sig: self.binding_sig,
             memo: self.memo,
             stamp,
@@ -544,13 +608,17 @@ impl Bundle<Unproven> {
 impl Bundle<ProofStamp> {
     /// Replace the stamp with a wtxid pointer to a covering aggregate.
     #[must_use]
-    pub fn strip(self, wtxid: PointerStamp) -> Bundle<PointerStamp> {
+    pub fn strip(self, wtxid: AggregateId) -> Bundle<PointerStamp> {
         Bundle {
             actions: self.actions,
             value_balance: self.value_balance,
+            fee_max_commitment: self.fee_max_commitment,
             binding_sig: self.binding_sig,
             memo: self.memo,
-            stamp: wtxid,
+            stamp: PointerStamp {
+                wtxid,
+                fee: self.stamp.fee,
+            },
         }
     }
 
@@ -574,47 +642,59 @@ impl Bundle<ProofStamp> {
             .descriptors()
             .chain(adjuncts.iter().flat_map(|&adj| adj.descriptors()))
             .collect();
+        let fee_descriptors: BTreeSet<fee::Descriptor> = iter::once(self.fee_descriptor())
+            .chain(adjuncts.iter().map(|&adj| adj.fee_descriptor()))
+            .collect();
 
-        let stamp = self.stamp.lift(rng, &descriptors, spans)?;
+        let stamp = self
+            .stamp
+            .lift(rng, &descriptors, &fee_descriptors, spans)?;
 
         Ok(Self { stamp, ..self })
     }
 
-    /// Confirm `hStampActionsTachyon` represents the combined actions of this
-    /// bundle and the given bundles.
+    /// Confirm `hStampCoverageTachyon` represents the combined actions and
+    /// fee descriptors of this bundle and the given bundles.
     #[must_use]
     pub fn is_covering(&self, others: &[&Bundle<dyn StampState>]) -> bool {
         let own_descs = self.descriptors();
         let other_descs = others.iter().flat_map(|&adjunct| adjunct.descriptors());
+        let fee_descriptors = iter::once(self.fee_descriptor())
+            .chain(others.iter().map(|&other| other.fee_descriptor()));
 
         self.stamp
-            .is_covering(own_descs.into_iter().chain(other_descs))
+            .is_covering(own_descs.into_iter().chain(other_descs), fee_descriptors)
     }
 
-    /// Confirm `hStampActionsTachyon` represents this bundle's actions.
+    /// Confirm `hStampCoverageTachyon` represents this bundle's actions and
+    /// fee descriptor.
     #[must_use]
     pub fn is_autonome(&self) -> bool {
         self.is_covering(&[])
     }
 
-    /// Confirm `hStampActionsTachyon` does not represent this bundle's actions.
+    /// Confirm `hStampCoverageTachyon` does not represent this bundle's actions
+    /// and fee descriptor.
     #[must_use]
     pub fn is_aggregate(&self) -> bool {
         !self.is_covering(&[])
     }
 
-    /// Verify the stamp's coverage against this bundle's own actions combined
-    /// with the given adjunct descriptors, returning the descriptors covered.
+    /// Verify the stamp's coverage against this bundle's own actions and fee
+    /// combined with the given adjunct descriptors and fees, returning the
+    /// descriptors covered.
     ///
     /// # Errors
     ///
-    /// Returns [`VerifyCoverageError`] if a descriptor repeats, an action
-    /// digest cannot be computed, or the recomputed coverage disagrees with
-    /// the one the stamp carries.
+    /// Returns [`VerifyCoverageError`] if a descriptor or fee repeats, an
+    /// action digest cannot be computed, or the recomputed coverage
+    /// disagrees with the one the stamp carries.
     pub fn verify_coverage(
         &self,
         adjunct_descs: &[action::Descriptor],
-    ) -> Result<BTreeSet<action::Descriptor>, VerifyCoverageError> {
+        adjunct_fee_descriptors: &[fee::Descriptor],
+    ) -> Result<(BTreeSet<action::Descriptor>, BTreeSet<fee::Descriptor>), VerifyCoverageError>
+    {
         let own_descs = self.descriptors();
 
         let n_descs = own_descs.len() + adjunct_descs.len();
@@ -626,27 +706,40 @@ impl Bundle<ProofStamp> {
             return Err(VerifyCoverageError::DuplicateActions);
         }
 
-        if !self.stamp.is_covering(unique_descs.clone()) {
+        let fee_descriptors: BTreeSet<fee::Descriptor> = iter::once(self.fee_descriptor())
+            .chain(adjunct_fee_descriptors.iter().copied())
+            .collect();
+
+        if fee_descriptors.len() != 1 + adjunct_fee_descriptors.len() {
+            return Err(VerifyCoverageError::DuplicateFees);
+        }
+
+        if !self
+            .stamp
+            .is_covering(unique_descs.clone(), fee_descriptors.clone())
+        {
             return Err(VerifyCoverageError::StampActionsMismatch);
         }
 
-        Ok(unique_descs)
+        Ok((unique_descs, fee_descriptors))
     }
 
-    /// Verify the stamp's published tachygrams: two per covered action, and
-    /// reproducing the carried set commitment. `action_count` is the size of
-    /// the covered set returned by [`Self::verify_coverage`].
+    /// Verify the stamp's published tachygrams: two per covered action and
+    /// one per covered fee, and reproducing the carried set commitment.
+    /// `action_count` and `fee_descriptor_count` are the sizes of the
+    /// covered sets returned by [`Self::verify_coverage`].
     ///
     /// # Errors
     ///
     /// Returns [`VerifyTachygramsError`] if the published count is not two
-    /// per covered action, or if they do not reproduce the carried set
-    /// commitment.
+    /// per covered action and one per covered fee descriptor, or if they do
+    /// not reproduce the carried set commitment.
     pub fn verify_tachygrams(
         &self,
         action_count: usize,
+        fee_descriptor_count: usize,
     ) -> Result<TachygramSetCommit, VerifyTachygramsError> {
-        if self.stamp.tachygrams.len() != 2 * action_count {
+        if self.stamp.tachygrams.len() != 2 * action_count + fee_descriptor_count {
             return Err(VerifyTachygramsError::WrongArity);
         }
 
@@ -665,7 +758,7 @@ impl Bundle<ProofStamp> {
     }
 
     /// Verify the pointers of the adjuncts against the expected wtxid,
-    /// returning the action descriptors they carry.
+    /// returning the action descriptors and fee descriptors they carry.
     ///
     /// # Errors
     ///
@@ -675,22 +768,26 @@ impl Bundle<ProofStamp> {
         &self,
         wtxid: &[u8; 64],
         adjuncts: &[&Bundle<PointerStamp>],
-    ) -> Result<Vec<action::Descriptor>, VerifyPointersError> {
-        if let Err(agg_id_err) = PointerStamp::try_from(*wtxid) {
+    ) -> Result<(Vec<action::Descriptor>, Vec<fee::Descriptor>), VerifyPointersError> {
+        if let Err(agg_id_err) = AggregateId::try_from(*wtxid) {
             return Err(VerifyPointersError::AdjunctPointerInvalid(agg_id_err));
         }
 
         if adjuncts
             .iter()
-            .any(|&adj| adj.stamp.stamp_digest() != *wtxid)
+            .any(|&adj| <[u8; 64]>::from(adj.stamp.wtxid) != *wtxid)
         {
             return Err(VerifyPointersError::AdjunctPointerMismatch);
         }
 
-        Ok(adjuncts.iter().flat_map(|&adj| adj.descriptors()).collect())
+        Ok((
+            adjuncts.iter().flat_map(|&adj| adj.descriptors()).collect(),
+            adjuncts.iter().map(|&adj| adj.fee_descriptor()).collect(),
+        ))
     }
 
-    /// Verify the stamp's proof against the given action digests.
+    /// Verify the stamp's proof against the given action digests, which
+    /// include the digests of covered fee descriptors.
     ///
     /// # Soundness
     ///
@@ -732,20 +829,21 @@ impl Bundle<ProofStamp> {
         self.verify_signatures(sighash)
             .map_err(VerificationError::Signatures)?;
 
-        let adjunct_descs = self
+        let (adjunct_descs, adjunct_fee_descriptors) = self
             .verify_pointers(wtxid, adjuncts)
             .map_err(VerificationError::Pointers)?;
 
-        let covered_descs = self
-            .verify_coverage(&adjunct_descs)
+        let (covered_descs, covered_fee_descriptors) = self
+            .verify_coverage(&adjunct_descs, &adjunct_fee_descriptors)
             .map_err(VerificationError::Coverage)?;
 
-        self.verify_tachygrams(covered_descs.len())
+        self.verify_tachygrams(covered_descs.len(), covered_fee_descriptors.len())
             .map_err(VerificationError::Tachygrams)?;
 
         let covered_digests = covered_descs
             .iter()
             .map(action::Descriptor::digest)
+            .chain(covered_fee_descriptors.iter().map(fee::Descriptor::digest))
             .collect::<Result<Vec<ActionDigest>, ActionDigestError>>()
             .map_err(VerificationError::Actions)?;
 
@@ -792,8 +890,8 @@ impl<S: StampState> Bundle<S> {
     }
 
     /// Read everything after the `tachyonBundleState` byte: value balance,
-    /// action descriptors, action sigs, binding sig, memo, and the stamp
-    /// trailer.
+    /// action descriptors, the max fee note's value commitment, action sigs,
+    /// binding sig, memo, and the stamp trailer.
     fn read_body<R: Read>(mut reader: R) -> io::Result<Self> {
         let value_balance = {
             let mut bytes = [0u8; size_of::<i64>()];
@@ -826,6 +924,17 @@ impl<S: StampState> Bundle<S> {
         for _ in 0..n_actions {
             descriptors.push(action::Descriptor::read(&mut reader)?);
         }
+
+        let fee_max_commitment = {
+            let point = serialization::read_ep_affine(&mut reader)?;
+            if bool::from(point.is_identity()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fee commitment is the identity",
+                ));
+            }
+            value::Commitment::from(point)
+        };
 
         let mut signatures: Vec<action::Signature> = Vec::new();
         for _ in 0..n_actions {
@@ -861,6 +970,7 @@ impl<S: StampState> Bundle<S> {
         Ok(Self {
             value_balance,
             actions,
+            fee_max_commitment,
             binding_sig,
             memo,
             stamp,
@@ -891,6 +1001,8 @@ impl<S: StampState> Bundle<S> {
             action.descriptor().write(&mut writer)?;
         }
 
+        serialization::write_ep_affine(&mut writer, &self.fee_max_commitment.into())?;
+
         for action in &self.actions {
             action.sig.write(&mut writer)?;
         }
@@ -910,8 +1022,9 @@ impl<S: StampState> Bundle<S> {
     /// Tachyon's contribution to the transaction `auth_digest`.
     ///
     /// Commits the action signatures, the binding signature, and the stamp's
-    /// digest. See [`blake2b::bundle_auth_digest`]. The memo is absent here
-    /// because it is effecting data, committed by [`Self::commitment`].
+    /// digest, which covers the fee. See [`blake2b::bundle_auth_digest`]. The
+    /// memo is absent here because it is effecting data, committed by
+    /// [`Self::commitment`].
     #[must_use]
     pub fn auth_digest(&self) -> [u8; 32] {
         let action_sigs: Vec<[u8; 64]> = self.actions.iter().map(|act| act.sig).collect();
@@ -1042,7 +1155,7 @@ impl TachyonBundle {
         }
     }
 
-    /// Confirm this bundle has a proof stamp, but its `hStampActionsTachyon`
+    /// Confirm this bundle has a proof stamp, but its `hStampCoverageTachyon`
     /// does not represent this bundle's actions.
     #[must_use]
     pub fn is_aggregate(&self) -> bool {
@@ -1054,7 +1167,7 @@ impl TachyonBundle {
         }
     }
 
-    /// Confirm this bundle has a proof stamp, and its `hStampActionsTachyon`
+    /// Confirm this bundle has a proof stamp, and its `hStampCoverageTachyon`
     /// represents this bundle's actions.
     #[must_use]
     pub fn is_autonome(&self) -> bool {
@@ -1066,8 +1179,8 @@ impl TachyonBundle {
         }
     }
 
-    /// Confirm `hStampActionsTachyon` represents the combined actions of this
-    /// bundle and the given bundles.
+    /// Confirm `hStampCoverageTachyon` represents the combined actions and
+    /// fee descriptors of this bundle and the given bundles.
     ///
     /// Descriptors are sorted but not deduplicated, so a collection containing
     /// duplicates mismatches.

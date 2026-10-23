@@ -22,14 +22,14 @@ use zcash_tachyon::{
     effect,
     entropy::ActionEntropy,
     keys::private,
-    stamp::{PointerStamp, ProofStamp, ProveError},
+    stamp::{AggregateId, PointerStamp, ProofStamp, ProveError},
     value, *,
 };
 
 use crate::fixtures::{
-    PoolSim, WalletSim, build_autonome, build_lift_span, build_output_plan, build_output_stamp,
-    forge_overlapping_merge, mock_sighash, mock_wtxid, random_block, random_block_with, shared_sk,
-    spend_witness,
+    PoolSim, WalletSim, build_autonome, build_bundle_plan, build_lift_span, build_output_plan,
+    build_output_stamp_with_fee, fee_digests, forge_overlapping_merge, mock_sighash, mock_wtxid,
+    random_block, random_block_with, shared_sk, spend_witness, stamp_coverage,
 };
 
 #[test]
@@ -40,7 +40,7 @@ fn plan_value_balance_sums_spends_and_outputs() {
     let spend = spend_plan_at(rng, &wallet, &ask, 300);
     let note = wallet.random_note(200);
     let (_rcv, _theta, output) = build_output_plan(rng, note);
-    let bundle_plan = Plan::new(alloc::vec![spend], alloc::vec![output]);
+    let bundle_plan = build_bundle_plan(alloc::vec![spend], alloc::vec![output]);
 
     assert_eq!(
         bundle_plan.value_balance(),
@@ -81,9 +81,9 @@ fn plan_commitment_matches_bundle_commitment() {
     let ask = wallet.sk.derive_auth_private();
     let note = wallet.random_note(200);
     let pool = PoolSim::genesis(rng);
-    let (stamp, output_plan) = build_output_stamp(rng, pool.anchor(), note);
+    let (stamp, output_plan, max_fee) = build_output_stamp_with_fee(rng, pool.anchor(), note);
 
-    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan]);
+    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan], max_fee);
     let sighash = mock_sighash(bundle_plan.commitment().unwrap());
 
     let bundle = bundle_plan
@@ -102,7 +102,7 @@ fn sign_signs_an_honest_plan() {
     let ask = wallet.sk.derive_auth_private();
     let spend = spend_plan_at(rng, &wallet, &ask, 200);
     let (_rcv, _theta, output) = build_output_plan(rng, wallet.random_note(100));
-    let plan = Plan::new(alloc::vec![spend], alloc::vec![output]);
+    let plan = build_bundle_plan(alloc::vec![spend], alloc::vec![output]);
 
     let bundle = plan
         .sign(rng, &mock_sighash(plan.commitment().unwrap()), &ask)
@@ -136,7 +136,7 @@ fn actions_signed_despite_wrong_rk_fail_verification() {
     );
     output.rk = unrelated.rk;
 
-    let plan = Plan::new(alloc::vec![spend], alloc::vec![output]);
+    let plan = build_bundle_plan(alloc::vec![spend], alloc::vec![output]);
 
     let bundle = plan
         .sign(rng, &mock_sighash(plan.commitment().unwrap()), &ask)
@@ -176,7 +176,7 @@ fn actions_signed_by_wrong_rsk_fail_verification() {
     let note = wallet.random_note(100);
     let (_rcv, _theta, output) = build_output_plan(rng, note);
 
-    let plan = Plan::new(alloc::vec![spend], alloc::vec![output]);
+    let plan = build_bundle_plan(alloc::vec![spend], alloc::vec![output]);
 
     let bundle = plan
         .sign(rng, &mock_sighash(plan.commitment().unwrap()), &wrong_ask)
@@ -212,7 +212,7 @@ fn apply_signatures_rejects_wrong_sig_count() {
     let spend_a = spend_plan_at(rng, &wallet, &ask, 200);
     let spend_b = spend_plan_at(rng, &wallet, &ask, 100);
     let spend_c = spend_plan_at(rng, &wallet, &ask, 300);
-    let plan = Plan::new(alloc::vec![spend_a, spend_b], alloc::vec![]);
+    let plan = build_bundle_plan(alloc::vec![spend_a, spend_b], alloc::vec![]);
 
     let sig_a = {
         let alpha = spend_a
@@ -269,7 +269,7 @@ fn apply_signatures_with_shuffled_sigs_fails_verification() {
 
     let spend_a = spend_plan_at(rng, &wallet, &ask, 200);
     let spend_b = spend_plan_at(rng, &wallet, &ask, 100);
-    let plan = Plan::new(alloc::vec![spend_a, spend_b], alloc::vec![]);
+    let plan = build_bundle_plan(alloc::vec![spend_a, spend_b], alloc::vec![]);
 
     // `sign` produces genuinely valid signatures, already in
     // `self.descriptors()`'s canonical order.
@@ -373,7 +373,7 @@ fn sign_and_apply_signatures_handle_one_sided_and_empty_plans() {
     let wallet = WalletSim::new(shared_sk());
     let ask = wallet.sk.derive_auth_private();
 
-    let spend_plan = Plan::new(
+    let spend_plan = build_bundle_plan(
         alloc::vec![spend_plan_at(rng, &wallet, &ask, 200)],
         alloc::vec![],
     );
@@ -385,14 +385,14 @@ fn sign_and_apply_signatures_handle_one_sided_and_empty_plans() {
 
     let note = wallet.random_note(200);
     let (_rcv, _theta, output) = build_output_plan(rng, note);
-    let output_plan = Plan::new(alloc::vec![], alloc::vec![output]);
+    let output_plan = build_bundle_plan(alloc::vec![], alloc::vec![output]);
     output_plan
         .sign(rng, &mock_sighash(output_plan.commitment().unwrap()), &ask)
         .expect("outputs-only plan signs")
         .verify_signatures(&mock_sighash(output_plan.commitment().unwrap()))
         .expect("outputs-only bundle verifies");
 
-    let empty_plan = Plan::new(alloc::vec![], alloc::vec![]);
+    let empty_plan = build_bundle_plan(alloc::vec![], alloc::vec![]);
     empty_plan
         .sign(rng, &mock_sighash(empty_plan.commitment().unwrap()), &ask)
         .expect("empty plan signs")
@@ -411,7 +411,7 @@ fn sign_and_apply_signatures_handle_one_sided_and_empty_plans() {
 
 #[test]
 fn no_bundle_commitment_differs_from_empty_bundle() {
-    let empty_plan = Plan::new(alloc::vec![], alloc::vec![]);
+    let empty_plan = build_bundle_plan(alloc::vec![], alloc::vec![]);
     assert_ne!(
         *blake2b::COMMIT_NO_BUNDLE,
         empty_plan.commitment().unwrap(),
@@ -425,15 +425,20 @@ fn zero_action_bundle_is_valid() {
     let wallet = WalletSim::new(shared_sk());
     let covering = build_autonome(rng, &wallet, 1000, 700);
 
-    let plan = Plan::new(alloc::vec![], alloc::vec![]);
+    let max_fee = wallet.random_note(0);
+    let plan = Plan::new(alloc::vec![], alloc::vec![], max_fee);
     let sighash = mock_sighash(plan.commitment().unwrap());
 
     let bundle = Bundle {
         actions: alloc::vec![],
         value_balance: value::Balance::ZERO,
+        fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
         binding_sig: plan.derive_bsk_private().sign(rng, &sighash),
         memo: Vec::new(),
-        stamp: mock_wtxid(&covering),
+        stamp: PointerStamp {
+            wtxid: mock_wtxid(&covering),
+            fee: value::Positive::ZERO,
+        },
     };
 
     bundle.verify_signatures(&sighash).unwrap();
@@ -486,29 +491,44 @@ fn double_spend_obvious() {
     let doubled = -2 * i64::try_from(u64::from(note.value)).expect("note value fits i64");
     let value_balance = value::Balance::try_from(doubled).expect("doubled balance stays in range");
     let action_bytes: Vec<[u8; 64]> = vec![descriptor, descriptor].into_iter().collect();
+    let max_fee = wallet.random_note(0);
+    let fee_max_commitment = max_fee.fee_blind().commit(-max_fee.value);
     let sighash = mock_sighash(blake2b::bundle_commitment(
         &blake2b::action_descriptor_digest(&action_bytes),
         doubled,
+        &fee_max_commitment.into(),
         &blake2b::memo_digest(&[]),
     ));
     let sig = private::ActionSigningKey::new(&alpha).sign(rng, &sighash);
     let action = Action::from((descriptor, sig));
-    let binding_sig = private::BindingSigningKey::from([rcv, rcv]).sign(rng, &sighash);
+    let binding_sig = Plan::new(alloc::vec![], alloc::vec![plan, plan], max_fee)
+        .derive_bsk_private()
+        .sign(rng, &sighash);
 
     // Forge the stamp by merging one output stamp with itself: the merge proof
     // commits to the doubled action and tachygram multisets.
-    let output_stamp = stamp::Plan::new(vec![], vec![(descriptor, theta, note, rcv)], anchor)
-        .prove(rng, &wallet.pak, vec![])
-        .expect("prove an output stamp");
+    let fee_descriptor = fee::Descriptor {
+        max_commitment: fee_max_commitment,
+        value: value::Positive::ZERO,
+    };
+    let output_stamp = stamp::Plan::new(
+        vec![],
+        vec![(descriptor, theta, note, rcv)],
+        anchor,
+        max_fee,
+        value::Positive::ZERO,
+    )
+    .prove(rng, &wallet.pak, vec![])
+    .expect("prove an output stamp");
     let evil_pcd = forge_overlapping_merge(
         rng,
-        (&output_stamp, &vec![descriptor]),
-        (&output_stamp, &vec![descriptor]),
+        (&output_stamp, &vec![descriptor], &[fee_descriptor]),
+        (&output_stamp, &vec![descriptor], &[fee_descriptor]),
     );
     let coverage = {
         let mut desc_bytes: Vec<[u8; 64]> = vec![descriptor, descriptor].into_iter().collect();
         desc_bytes.sort_unstable();
-        blake2b::action_descriptor_digest(&desc_bytes)
+        stamp_coverage(&desc_bytes, &[fee_descriptor])
     };
 
     // A tachygram set with duplicated elements wouldn't be accepted by
@@ -524,11 +544,13 @@ fn double_spend_obvious() {
             .commit(),
         tachygrams: output_stamp.tachygrams.iter().copied().collect(),
         proof: Box::new(evil_pcd.proof().clone()),
+        fee: output_stamp.fee,
     };
 
     let bundle = Bundle {
         actions: vec![action, action],
         value_balance,
+        fee_max_commitment,
         binding_sig,
         memo: Vec::new(),
         stamp,
@@ -557,7 +579,7 @@ fn double_spend_obvious() {
     // `verify_coverage` rejects the duplicate; deduplicating the descriptors
     // shrinks the count below the wire multiset.
     let dup_err = decoded
-        .verify_coverage(&[])
+        .verify_coverage(&[], &[])
         .expect_err("duplicated actions must be rejected");
     let VerifyCoverageError::DuplicateActions = dup_err else {
         panic!("expected DuplicateActions, got {dup_err:?}");
@@ -572,6 +594,7 @@ fn double_spend_obvious() {
     let digests: Vec<ActionDigest> = decoded
         .descriptors()
         .map(|desc| desc.digest().expect("action digest"))
+        .chain(fee_digests([fee_descriptor, fee_descriptor]))
         .collect();
     assert!(
         !decoded
@@ -613,8 +636,10 @@ fn duplicated_spend_cannot_inflate() {
     });
     let descriptor = plan.descriptor();
     let secret = wallet.secret_pcd(rng, note);
-    let honest_stamp = Plan::new(alloc::vec![plan], alloc::vec![])
-        .stamp_plan(anchor)
+    let max_fee = wallet.random_note(0);
+    let fee_max_commitment = max_fee.fee_blind().commit(-max_fee.value);
+    let honest_stamp = Plan::new(alloc::vec![plan], alloc::vec![], max_fee)
+        .stamp_plan(anchor, value::Positive::ZERO)
         .prove(rng, &wallet.pak, alloc::vec![(secret, spendable, vec![])])
         .expect("prove the honest single spend");
 
@@ -627,6 +652,7 @@ fn duplicated_spend_cannot_inflate() {
     let sighash = mock_sighash(blake2b::bundle_commitment(
         &blake2b::action_descriptor_digest(&action_bytes),
         doubled,
+        &fee_max_commitment.into(),
         &blake2b::memo_digest(&[]),
     ));
     let alpha = theta.randomizer::<effect::Spend>(note.commitment());
@@ -636,15 +662,24 @@ fn duplicated_spend_cannot_inflate() {
         .derive_action_private(&alpha)
         .sign(rng, &sighash);
     let action = Action::from((descriptor, sig));
-    let binding_sig = private::BindingSigningKey::from([rcv, rcv]).sign(rng, &sighash);
+    let binding_sig = Plan::new(alloc::vec![plan, plan], alloc::vec![], max_fee)
+        .derive_bsk_private()
+        .sign(rng, &sighash);
     let coverage = {
         let mut desc_bytes = Vec::<[u8; 64]>::from_iter([descriptor, descriptor]);
         desc_bytes.sort_unstable();
-        blake2b::action_descriptor_digest(&desc_bytes)
+        stamp_coverage(
+            &desc_bytes,
+            &[fee::Descriptor {
+                max_commitment: fee_max_commitment,
+                value: value::Positive::ZERO,
+            }],
+        )
     };
     let bundle = Bundle {
         actions: vec![action, action],
         value_balance,
+        fee_max_commitment,
         binding_sig,
         memo: Vec::new(),
         stamp: ProofStamp {
@@ -653,6 +688,7 @@ fn duplicated_spend_cannot_inflate() {
             tachygram_set: honest_stamp.tachygram_set,
             tachygrams: honest_stamp.tachygrams,
             proof: honest_stamp.proof,
+            fee: honest_stamp.fee,
         },
     };
 
@@ -672,8 +708,8 @@ fn duplicated_spend_cannot_inflate() {
     );
     assert_eq!(
         decoded.stamp.tachygrams.len(),
-        2,
-        "a single spend contributes exactly one present/next nullifier pair"
+        2 + 1,
+        "a single spend contributes exactly one present/next nullifier pair plus the fee change commitment"
     );
     let withdrawn: i64 = decoded.value_balance.into();
     let backed = i64::try_from(u64::from(note.value)).expect("note value fits i64");
@@ -682,7 +718,7 @@ fn duplicated_spend_cannot_inflate() {
     // `verify_coverage` rejects the duplicate; deduplicating the descriptors
     // shrinks the count below the wire multiset.
     let dup_err = decoded
-        .verify_coverage(&[])
+        .verify_coverage(&[], &[])
         .expect_err("the duplicated spend must be rejected");
     let VerifyCoverageError::DuplicateActions = dup_err else {
         panic!("expected DuplicateActions, got {dup_err:?}");
@@ -694,6 +730,7 @@ fn duplicated_spend_cannot_inflate() {
     let digests: Vec<ActionDigest> = decoded
         .descriptors()
         .map(|desc| desc.digest().expect("action digest"))
+        .chain([decoded.fee_descriptor().digest().expect("fee digest")])
         .collect();
     assert!(
         !decoded
@@ -731,7 +768,7 @@ fn verify_proof_rejects_action_shared_with_adjunct() {
 
     let adjunct_descs: Vec<action::Descriptor> = adjunct.descriptors().collect();
     let err = bundle
-        .verify_coverage(&adjunct_descs)
+        .verify_coverage(&adjunct_descs, &[adjunct.fee_descriptor()])
         .expect_err("an action shared across self and adjunct must be rejected");
     let VerifyCoverageError::DuplicateActions = err else {
         panic!("expected DuplicateActions, got {err:?}");
@@ -741,6 +778,7 @@ fn verify_proof_rejects_action_shared_with_adjunct() {
         .descriptors()
         .chain(adjunct.descriptors())
         .map(|desc| desc.digest().expect("action digest"))
+        .chain([bundle.fee_descriptor().digest().expect("fee digest")])
         .collect();
     assert!(
         !bundle
@@ -768,6 +806,7 @@ fn verify_proof_disproves_uncovered_adjunct() {
         .descriptors()
         .chain(adjunct.descriptors())
         .map(|desc| desc.digest().expect("action digest"))
+        .chain([bundle.fee_descriptor().digest().expect("fee digest")])
         .collect();
     assert!(
         !bundle
@@ -810,7 +849,7 @@ fn double_spend_secret() {
         "independent theta gives distinct rk"
     );
 
-    let plan = Plan::new(alloc::vec![spend_a, spend_b], alloc::vec![]);
+    let plan = build_bundle_plan(alloc::vec![spend_a, spend_b], alloc::vec![]);
     let bundle = plan
         .sign(rng, &mock_sighash(plan.commitment().unwrap()), &ask)
         .expect("signing works");
@@ -868,15 +907,43 @@ fn innocent_aggregate_from_two_autonomes() {
     let stamp_b = autonome_b.stamp.clone();
 
     let innocent = {
-        let innocent_plan = Plan::new(alloc::vec![], alloc::vec![]);
+        let max_fee = wallet.random_note(0);
+        let innocent_plan = Plan::new(alloc::vec![], alloc::vec![], max_fee);
         let innocent_sighash = mock_sighash(innocent_plan.commitment().unwrap());
 
-        let stamp = ProofStamp::merge(rng, (stamp_a, descriptors_a), (stamp_b, descriptors_b))
-            .expect("merge");
+        let fees_a = BTreeSet::from([autonome_a.fee_descriptor()]);
+        let fees_b = BTreeSet::from([autonome_b.fee_descriptor()]);
+        let seed = stamp::Plan::new(vec![], vec![], anchor_a, max_fee, value::Positive::ZERO)
+            .prove(rng, &wallet.pak, vec![])
+            .expect("seed");
+        let descs = descriptors_a.union(&descriptors_b).copied().collect();
+        let fees = fees_a.union(&fees_b).copied().collect();
+        let adjuncts = stamp_a
+            .merge(
+                rng,
+                (descriptors_a, fees_a),
+                (stamp_b, descriptors_b, fees_b),
+            )
+            .expect("merge adjuncts");
+        let stamp = seed
+            .merge(
+                rng,
+                (
+                    BTreeSet::new(),
+                    [fee::Descriptor {
+                        max_commitment: max_fee.fee_blind().commit(-max_fee.value),
+                        value: value::Positive::ZERO,
+                    }]
+                    .into(),
+                ),
+                (adjuncts, descs, fees),
+            )
+            .expect("merge seed");
 
         Bundle {
             actions: alloc::vec![],
             value_balance: value::Balance::ZERO,
+            fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
             binding_sig: innocent_plan
                 .derive_bsk_private()
                 .sign(rng, &innocent_sighash),
@@ -896,11 +963,15 @@ fn innocent_aggregate_from_two_autonomes() {
 
     let adjunct_descs: Vec<action::Descriptor> =
         adjuncts.iter().flat_map(Bundle::descriptors).collect();
-    let digests: Vec<ActionDigest> = innocent
-        .verify_coverage(&adjunct_descs)
-        .expect("the innocent aggregate covers its adjuncts")
+    let adjunct_fee_descriptors: Vec<fee::Descriptor> =
+        adjuncts.iter().map(Bundle::fee_descriptor).collect();
+    let (covered_descs, covered_fee_descriptors) = innocent
+        .verify_coverage(&adjunct_descs, &adjunct_fee_descriptors)
+        .expect("the innocent aggregate covers its adjuncts");
+    let digests: Vec<ActionDigest> = covered_descs
         .iter()
         .map(|desc| desc.digest().expect("action digest"))
+        .chain(fee_digests(covered_fee_descriptors))
         .collect();
     assert!(
         innocent
@@ -908,6 +979,14 @@ fn innocent_aggregate_from_two_autonomes() {
             .expect("innocent aggregate proof verifies against its adjuncts"),
         "innocent aggregate proof must verify against its adjuncts"
     );
+    innocent
+        .verify(
+            rng,
+            &mock_sighash(innocent.commitment()),
+            &mock_wtxid(&innocent).into(),
+            &adjuncts.iter().collect::<Vec<_>>(),
+        )
+        .expect("innocent verifies against both adjuncts");
 }
 
 #[test]
@@ -981,15 +1060,26 @@ fn based_aggregate_with_two_adjuncts() {
 
     let innocent_descriptors: BTreeSet<action::Descriptor> =
         descriptors_a.union(&descriptors_b).copied().collect();
-    let innocent_stamp = ProofStamp::merge(rng, (stamp_a, descriptors_a), (stamp_b, descriptors_b))
+    let fees_a = BTreeSet::from([autonome_a.fee_descriptor()]);
+    let fees_b = BTreeSet::from([autonome_b.fee_descriptor()]);
+    let innocent_fees = fees_a.union(&fees_b).copied().collect();
+    let innocent_stamp = stamp_a
+        .merge(
+            rng,
+            (descriptors_a, fees_a),
+            (stamp_b, descriptors_b, fees_b),
+        )
         .expect("innocent merge");
 
-    let based_stamp = ProofStamp::merge(
-        rng,
-        (becomes_based.stamp, based_descriptors),
-        (innocent_stamp, innocent_descriptors),
-    )
-    .expect("based merge");
+    let based_fees = BTreeSet::from([becomes_based.fee_descriptor()]);
+    let based_stamp = becomes_based
+        .stamp
+        .merge(
+            rng,
+            (based_descriptors, based_fees),
+            (innocent_stamp, innocent_descriptors, innocent_fees),
+        )
+        .expect("based merge");
 
     becomes_based.stamp = based_stamp;
 
@@ -1005,11 +1095,15 @@ fn based_aggregate_with_two_adjuncts() {
 
     let adjunct_descs: Vec<action::Descriptor> =
         adjuncts.iter().flat_map(|adj| adj.descriptors()).collect();
-    let digests: Vec<ActionDigest> = becomes_based
-        .verify_coverage(&adjunct_descs)
-        .expect("the based aggregate covers itself and its adjuncts")
+    let adjunct_fee_descriptors: Vec<fee::Descriptor> =
+        adjuncts.iter().map(|adj| adj.fee_descriptor()).collect();
+    let (covered_descs, covered_fee_descriptors) = becomes_based
+        .verify_coverage(&adjunct_descs, &adjunct_fee_descriptors)
+        .expect("the based aggregate covers itself and its adjuncts");
+    let digests: Vec<ActionDigest> = covered_descs
         .iter()
         .map(|desc| desc.digest().expect("action digest"))
+        .chain(fee_digests(covered_fee_descriptors))
         .collect();
     assert!(
         becomes_based
@@ -1175,9 +1269,12 @@ fn read_preserves_action_order() {
     // on it.
     let value_balance = value::Balance::try_from(-500i64).expect("in range");
     let descriptors: Vec<[u8; 64]> = items.iter().map(|item| item.0).collect();
+    let max_fee = wallet.random_note(0);
+    let fee_max_commitment = max_fee.fee_blind().commit(-max_fee.value);
     let sighash = mock_sighash(blake2b::bundle_commitment(
         &blake2b::action_descriptor_digest(&descriptors),
         value_balance.into(),
+        &fee_max_commitment.into(),
         &blake2b::memo_digest(&[]),
     ));
     let actions: Vec<Action> = items
@@ -1189,15 +1286,20 @@ fn read_preserves_action_order() {
             ))
         })
         .collect();
-    let binding_sig =
-        private::BindingSigningKey::from(items.iter().map(|item| item.2)).sign(rng, &sighash);
+    let binding_sig = Plan::new(alloc::vec![], alloc::vec![plan_a, plan_b], max_fee)
+        .derive_bsk_private()
+        .sign(rng, &sighash);
 
     let bundle = Bundle {
         actions,
         value_balance,
+        fee_max_commitment,
         binding_sig,
         memo: Vec::new(),
-        stamp: PointerStamp::try_from([0x11u8; 64]).expect("nonzero wtxid"),
+        stamp: PointerStamp {
+            wtxid: AggregateId::try_from([0x11u8; 64]).expect("nonzero wtxid"),
+            fee: value::Positive::ZERO,
+        },
     };
 
     let mut buf = Vec::new();
@@ -1227,7 +1329,7 @@ fn stripped_read_write_round_trip() {
 
     assert_eq!(stripped.commitment(), deserialized.commitment());
     assert_eq!(stripped.auth_digest(), deserialized.auth_digest());
-    assert_eq!(deserialized.stamp, wtxid);
+    assert_eq!(deserialized.stamp.wtxid, wtxid);
 }
 
 #[test]
@@ -1259,7 +1361,7 @@ fn tachyon_bundle_conversions() {
 
         assert_eq!(stripped.commitment(), back.commitment());
         assert_eq!(stripped.auth_digest(), back.auth_digest());
-        assert_eq!(back.stamp, wtxid);
+        assert_eq!(back.stamp.wtxid, wtxid);
     }
 
     // Err: TryFrom rejects the wrong variant in both directions.
@@ -1315,7 +1417,7 @@ fn tachyon_bundle_wire_round_trip() {
 
 #[test]
 fn aggregate_id_try_from_rejects_zero() {
-    PointerStamp::try_from([0u8; 64]).unwrap_err();
+    AggregateId::try_from([0u8; 64]).unwrap_err();
 }
 
 #[test]
@@ -1388,14 +1490,19 @@ fn read_rejects_zero_wtxid() {
     };
 
     let innocent = {
-        let plan = Plan::new(alloc::vec![], alloc::vec![]);
+        let max_fee = wallet.random_note(0);
+        let plan = Plan::new(alloc::vec![], alloc::vec![], max_fee);
         let sighash = mock_sighash(plan.commitment().unwrap());
         let bundle = Bundle {
             actions: alloc::vec![],
             value_balance: value::Balance::ZERO,
+            fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
             binding_sig: plan.derive_bsk_private().sign(rng, &sighash),
             memo: Vec::new(),
-            stamp: wtxid,
+            stamp: PointerStamp {
+                wtxid,
+                fee: value::Positive::ZERO,
+            },
         };
         assert_eq!(bundle.actions, []);
         bundle
@@ -1436,15 +1543,20 @@ fn innocent_round_trips_with_nonzero_wtxid() {
     let wallet = WalletSim::new(shared_sk());
     let covering = build_autonome(rng, &wallet, 1000, 700);
 
-    let plan = Plan::new(alloc::vec![], alloc::vec![]);
+    let max_fee = wallet.random_note(0);
+    let plan = Plan::new(alloc::vec![], alloc::vec![], max_fee);
     let sighash = mock_sighash(plan.commitment().unwrap());
 
     let innocent = Bundle {
         actions: alloc::vec![],
         value_balance: value::Balance::ZERO,
+        fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
         binding_sig: plan.derive_bsk_private().sign(rng, &sighash),
         memo: Vec::new(),
-        stamp: mock_wtxid(&covering),
+        stamp: PointerStamp {
+            wtxid: mock_wtxid(&covering),
+            fee: value::Positive::ZERO,
+        },
     };
 
     let mut buf = Vec::new();
@@ -1476,8 +1588,8 @@ fn auth_digest_invariants() {
         assert_ne!(stamped.auth_digest(), stripped.auth_digest());
     }
 
-    // wtxid binds: distinct wtxids on otherwise-identical stripped bundles
-    // produce distinct digests.
+    // wtxid and fee bind: distinct wtxids or fees on otherwise-identical
+    // stripped bundles produce distinct digests.
     {
         let rng = &mut StdRng::seed_from_u64(0);
         let wallet = WalletSim::new(shared_sk());
@@ -1492,6 +1604,11 @@ fn auth_digest_invariants() {
         let stripped_bb = autonome.strip(mock_wtxid(&covering_b));
         let digest_bb = stripped_bb.auth_digest();
         assert_ne!(digest_aa, digest_bb);
+
+        let mut stripped_fee = stripped_aa;
+        stripped_fee.stamp.fee = value::Positive::try_from(u64::from(stripped_fee.stamp.fee) + 1)
+            .expect("test fee in range");
+        assert_ne!(digest_aa, stripped_fee.auth_digest());
     }
 
     // TachyonBundle dispatch matches the concrete-variant methods, for both
@@ -1513,7 +1630,8 @@ fn auth_digest_invariants() {
     }
 
     // The proof stamp's digest commits its contents: perturbing the carried
-    // covered-actions digest or the tachygram set changes the auth_digest.
+    // covered-actions digest, the fee or the tachygram set changes the
+    // auth_digest.
     {
         let rng = &mut StdRng::seed_from_u64(0);
         let wallet = WalletSim::new(shared_sk());
@@ -1526,6 +1644,12 @@ fn auth_digest_invariants() {
         // the commitment does not reach into the stamp: only auth_digest moves.
         assert_eq!(baseline_commitment, altered_actions.commitment());
         assert_ne!(baseline, altered_actions.auth_digest());
+
+        let mut altered_fee = stamped.clone();
+        altered_fee.stamp.fee =
+            value::Positive::try_from(u64::from(stamped.stamp.fee) + 1).expect("test fee in range");
+        assert_eq!(baseline_commitment, altered_fee.commitment());
+        assert_ne!(baseline, altered_fee.auth_digest());
 
         let mut extra_tachygram = stamped;
         extra_tachygram
@@ -1541,7 +1665,7 @@ fn auth_digest_invariants() {
 /// Coverage-check protocol: an observer reconstructs the covered-actions
 /// digest from a based aggregate's own actions plus all covered adjuncts'
 /// visible actions, and checks it against the stamped aggregate's
-/// serialized `hStampActionsTachyon`.
+/// serialized `hStampCoverageTachyon`.
 #[test]
 fn coverage_check_matches_stamp_actions() {
     let rng = &mut StdRng::seed_from_u64(0);
@@ -1606,18 +1730,29 @@ fn coverage_check_matches_stamp_actions() {
 
     let stamp_a = autonome_a.stamp.clone();
     let stamp_b = autonome_b.stamp.clone();
+    let fees_a = BTreeSet::from([autonome_a.fee_descriptor()]);
+    let fees_b = BTreeSet::from([autonome_b.fee_descriptor()]);
+    let innocent_fees = fees_a.union(&fees_b).copied().collect();
+    let based_fees = BTreeSet::from([becomes_based.fee_descriptor()]);
 
     let innocent_descriptors: BTreeSet<action::Descriptor> =
         descriptors_a.union(&descriptors_b).copied().collect();
-    let innocent_stamp = ProofStamp::merge(rng, (stamp_a, descriptors_a), (stamp_b, descriptors_b))
+    let innocent_stamp = stamp_a
+        .merge(
+            rng,
+            (descriptors_a, fees_a),
+            (stamp_b, descriptors_b, fees_b),
+        )
         .expect("innocent merge");
 
-    let based_stamp = ProofStamp::merge(
-        rng,
-        (becomes_based.stamp, based_descriptors),
-        (innocent_stamp, innocent_descriptors),
-    )
-    .expect("based merge");
+    let based_stamp = becomes_based
+        .stamp
+        .merge(
+            rng,
+            (based_descriptors, based_fees),
+            (innocent_stamp, innocent_descriptors, innocent_fees),
+        )
+        .expect("based merge");
     becomes_based.stamp = based_stamp;
 
     let adjunct_a = autonome_a.strip(mock_wtxid(&becomes_based));
@@ -1627,7 +1762,7 @@ fn coverage_check_matches_stamp_actions() {
     // its own actions plus both covered adjuncts'.
     assert!(
         becomes_based.is_covering(&[&adjunct_a, &adjunct_b]),
-        "full covered set matches hStampActionsTachyon"
+        "full covered set matches hStampCoverageTachyon"
     );
 
     // Missing an adjunct: fewer descriptors, no match.
@@ -1694,7 +1829,7 @@ fn plan_value_balance_accepts_boundary_max_money() {
     let wallet = WalletSim::random(rng);
     let ask = wallet.sk.derive_auth_private();
     let spend = spend_plan_at(rng, &wallet, &ask, MAX_MONEY);
-    let bundle_plan = Plan::new(alloc::vec![spend], alloc::vec![]);
+    let bundle_plan = build_bundle_plan(alloc::vec![spend], alloc::vec![]);
 
     assert_eq!(
         bundle_plan.value_balance(),
@@ -1708,7 +1843,7 @@ fn plan_value_balance_accepts_boundary_negative_max_money() {
     let wallet = WalletSim::random(rng);
     let note = wallet.random_note(MAX_MONEY);
     let (_rcv, _theta, output) = build_output_plan(rng, note);
-    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output]);
+    let bundle_plan = build_bundle_plan(alloc::vec![], alloc::vec![output]);
 
     assert_eq!(
         bundle_plan.value_balance(),
@@ -1723,7 +1858,7 @@ fn plan_value_balance_rejects_overflow_above_max_money() {
     let ask = wallet.sk.derive_auth_private();
     let spend_a = spend_plan_at(rng, &wallet, &ask, MAX_MONEY);
     let spend_b = spend_plan_at(rng, &wallet, &ask, MAX_MONEY);
-    let bundle_plan = Plan::new(alloc::vec![spend_a, spend_b], alloc::vec![]);
+    let bundle_plan = build_bundle_plan(alloc::vec![spend_a, spend_b], alloc::vec![]);
 
     assert_eq!(bundle_plan.value_balance(), Err(value::OutOfRange));
     {
@@ -1746,7 +1881,7 @@ fn plan_value_balance_rejects_overflow_below_negative_max_money() {
     let note_b = wallet.random_note(MAX_MONEY);
     let (_, _, output_a) = build_output_plan(rng, note_a);
     let (_, _, output_b) = build_output_plan(rng, note_b);
-    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_a, output_b]);
+    let bundle_plan = build_bundle_plan(alloc::vec![], alloc::vec![output_a, output_b]);
 
     assert_eq!(bundle_plan.value_balance(), Err(value::OutOfRange));
     {
@@ -1812,15 +1947,20 @@ fn read_rejects_value_balance_out_of_range() {
 #[test]
 fn read_rejects_zero_actions_with_nonzero_balance() {
     let rng = &mut StdRng::seed_from_u64(0);
-    let plan = Plan::new(alloc::vec![], alloc::vec![]);
+    let max_fee = WalletSim::new(shared_sk()).random_note(0);
+    let plan = Plan::new(alloc::vec![], alloc::vec![], max_fee);
     let sighash = mock_sighash(plan.commitment().unwrap());
 
     let bundle = Bundle {
         actions: alloc::vec![],
         value_balance: value::Balance::try_from(1).unwrap(),
+        fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
         binding_sig: plan.derive_bsk_private().sign(rng, &sighash),
         memo: Vec::new(),
-        stamp: PointerStamp::try_from([0x42u8; 64]).expect("nonzero id"),
+        stamp: PointerStamp {
+            wtxid: AggregateId::try_from([0x42u8; 64]).expect("nonzero id"),
+            fee: value::Positive::ZERO,
+        },
     };
 
     let mut buf = Vec::new();
@@ -1852,15 +1992,20 @@ fn read_rejects_zero_actions_with_nonzero_balance() {
 #[test]
 fn zero_action_bundle_rejects_nonzero_balance() {
     let rng = &mut StdRng::seed_from_u64(0);
-    let plan = Plan::new(alloc::vec![], alloc::vec![]);
+    let max_fee = WalletSim::new(shared_sk()).random_note(0);
+    let plan = Plan::new(alloc::vec![], alloc::vec![], max_fee);
     let sighash = mock_sighash(plan.commitment().unwrap());
 
     let bundle = Bundle {
         actions: alloc::vec![],
         value_balance: value::Balance::try_from(1).unwrap(),
+        fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
         binding_sig: plan.derive_bsk_private().sign(rng, &sighash),
         memo: Vec::new(),
-        stamp: PointerStamp::try_from([1u8; 64]).expect("nonzero id"),
+        stamp: PointerStamp {
+            wtxid: AggregateId::try_from([1u8; 64]).expect("nonzero id"),
+            fee: value::Positive::ZERO,
+        },
     };
 
     let err = bundle.verify_signatures(&sighash).unwrap_err();
@@ -1879,26 +2024,32 @@ fn verify_tachygrams_rejects_wrong_arity() {
     let ask = wallet.sk.derive_auth_private();
     let note = wallet.random_note(200);
     let pool = PoolSim::genesis(rng);
-    let (stamp, output_plan) = build_output_stamp(rng, pool.anchor(), note);
+    let (stamp, output_plan, max_fee) = build_output_stamp_with_fee(rng, pool.anchor(), note);
 
-    assert_eq!(stamp.tachygrams.len(), 2, "an output publishes cm and pad");
+    assert_eq!(
+        stamp.tachygrams.len(),
+        2 + 1,
+        "an output publishes cm and pad plus the fee change commitment"
+    );
 
     let mut short = stamp;
     let dropped = *short.tachygrams.iter().next().expect("nonempty");
     short.tachygrams.remove(&dropped);
 
-    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan]);
+    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan], max_fee);
     let sighash = mock_sighash(bundle_plan.commitment().unwrap());
     let bundle = bundle_plan
         .sign(rng, &sighash, &ask)
         .expect("sign output bundle")
         .stamp(short);
 
-    let covered = bundle
-        .verify_coverage(&[])
+    let (covered, covered_fees) = bundle
+        .verify_coverage(&[], &[])
         .expect("the arity rule is not coverage's business");
 
-    let err = bundle.verify_tachygrams(covered.len()).unwrap_err();
+    let err = bundle
+        .verify_tachygrams(covered.len(), covered_fees.len())
+        .unwrap_err();
     let VerifyTachygramsError::WrongArity = err else {
         panic!("expected WrongArity, got {err:?}");
     };
@@ -1913,7 +2064,7 @@ fn verify_tachygrams_rejects_a_tampered_list() {
     let ask = wallet.sk.derive_auth_private();
     let note = wallet.random_note(200);
     let pool = PoolSim::genesis(rng);
-    let (stamp, output_plan) = build_output_stamp(rng, pool.anchor(), note);
+    let (stamp, output_plan, max_fee) = build_output_stamp_with_fee(rng, pool.anchor(), note);
 
     // Swap one tachygram for another, keeping the count and the carried
     // commitment, so coverage has nothing to say about it.
@@ -1924,19 +2075,19 @@ fn verify_tachygrams_rejects_a_tampered_list() {
         .tachygrams
         .insert(Tachygram::from(Fp::random(&mut *rng)));
 
-    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan]);
+    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan], max_fee);
     let sighash = mock_sighash(bundle_plan.commitment().unwrap());
     let bundle = bundle_plan
         .sign(rng, &sighash, &ask)
         .expect("sign output bundle")
         .stamp(tampered);
 
-    let covered = bundle
-        .verify_coverage(&[])
+    let (covered, covered_fees) = bundle
+        .verify_coverage(&[], &[])
         .expect("coverage over the one output action");
 
     let err = bundle
-        .verify_tachygrams(covered.len())
+        .verify_tachygrams(covered.len(), covered_fees.len())
         .expect_err("a tampered list must be rejected");
     assert_eq!(
         err.to_string(),
@@ -2002,10 +2153,11 @@ fn plan_memo_reaches_the_signed_bundle() {
     let ask = wallet.sk.derive_auth_private();
     let note = wallet.random_note(200);
     let pool = PoolSim::genesis(rng);
-    let (stamp, output_plan) = build_output_stamp(rng, pool.anchor(), note);
+    let (stamp, output_plan, max_fee) = build_output_stamp_with_fee(rng, pool.anchor(), note);
 
     let memo = vec![0x7Fu8; 900];
-    let bundle_plan = Plan::new(alloc::vec![], alloc::vec![output_plan]).with_memo(memo.clone());
+    let bundle_plan =
+        Plan::new(alloc::vec![], alloc::vec![output_plan], max_fee).with_memo(memo.clone());
     let sighash = mock_sighash(bundle_plan.commitment().unwrap());
 
     let bundle = bundle_plan
@@ -2081,7 +2233,7 @@ fn bundle_lift_preserves_coverage() {
         vec![output_note],
     );
 
-    let descriptors = bundle.verify_coverage(&[]).expect("autonome coverage");
+    let descriptors = bundle.verify_coverage(&[], &[]).expect("autonome coverage");
 
     // Two following stamps, so the span fuses rather than standing on one
     // seed.
@@ -2098,7 +2250,7 @@ fn bundle_lift_preserves_coverage() {
     assert!(lifted.is_autonome());
     assert_eq!(
         lifted
-            .verify_coverage(&[])
+            .verify_coverage(&[], &[])
             .expect("coverage survives a lift"),
         descriptors
     );
@@ -2167,20 +2319,47 @@ fn bundle_lift_over_an_aggregate() {
     let descriptors_b: BTreeSet<action::Descriptor> =
         autonome_b.actions.iter().map(Action::descriptor).collect();
 
-    let innocent_plan = Plan::new(vec![], vec![]);
+    let max_fee = wallet.random_note(0);
+    let fees_a = BTreeSet::from([autonome_a.fee_descriptor()]);
+    let fees_b = BTreeSet::from([autonome_b.fee_descriptor()]);
+    let innocent_plan = Plan::new(vec![], vec![], max_fee);
+    let seed = innocent_plan
+        .stamp_plan(anchor, value::Positive::ZERO)
+        .prove(rng, &wallet.pak, vec![])
+        .expect("seed");
+    let descs = descriptors_a.union(&descriptors_b).copied().collect();
+    let fees = fees_a.union(&fees_b).copied().collect();
+    let adjunct_stamp = autonome_a
+        .stamp
+        .clone()
+        .merge(
+            rng,
+            (descriptors_a, fees_a),
+            (autonome_b.stamp.clone(), descriptors_b, fees_b),
+        )
+        .expect("merge adjuncts");
     let innocent = Bundle {
         actions: vec![],
         value_balance: value::Balance::ZERO,
+        fee_max_commitment: max_fee.fee_blind().commit(-max_fee.value),
         binding_sig: innocent_plan
             .derive_bsk_private()
             .sign(rng, &mock_sighash(innocent_plan.commitment().unwrap())),
         memo: Vec::new(),
-        stamp: ProofStamp::merge(
-            rng,
-            (autonome_a.stamp.clone(), descriptors_a),
-            (autonome_b.stamp.clone(), descriptors_b),
-        )
-        .expect("merge"),
+        stamp: seed
+            .merge(
+                rng,
+                (
+                    BTreeSet::new(),
+                    [fee::Descriptor {
+                        max_commitment: max_fee.fee_blind().commit(-max_fee.value),
+                        value: value::Positive::ZERO,
+                    }]
+                    .into(),
+                ),
+                (adjunct_stamp, descs, fees),
+            )
+            .expect("merge seed"),
     };
 
     let adjunct_a = autonome_a.strip(mock_wtxid(&innocent));
@@ -2202,11 +2381,15 @@ fn bundle_lift_over_an_aggregate() {
 
     let adjunct_descs: Vec<action::Descriptor> =
         adjuncts.iter().flat_map(|adj| adj.descriptors()).collect();
-    let digests: Vec<ActionDigest> = lifted
-        .verify_coverage(&adjunct_descs)
-        .expect("a lift leaves the covered action set alone")
+    let adjunct_fee_descriptors: Vec<fee::Descriptor> =
+        adjuncts.iter().map(|adj| adj.fee_descriptor()).collect();
+    let (covered_descs, covered_fee_descriptors) = lifted
+        .verify_coverage(&adjunct_descs, &adjunct_fee_descriptors)
+        .expect("a lift leaves the covered action set alone");
+    let digests: Vec<ActionDigest> = covered_descs
         .iter()
         .map(|desc| desc.digest().expect("action digest"))
+        .chain(fee_digests(covered_fee_descriptors))
         .collect();
     assert!(
         lifted

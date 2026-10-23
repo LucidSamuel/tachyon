@@ -16,6 +16,7 @@ pub mod bundle;
 pub mod constants;
 pub mod digest;
 pub mod entropy;
+pub mod fee;
 pub mod keys;
 pub mod note;
 pub mod nullifier;
@@ -38,4 +39,6 @@ pub use bundle::{
 pub use note::Note;
 pub use primitives::*;
 pub use serialization::compactsize::{CompactSize, CompactSizeError};
-pub use stamp::{AggregateIdError, Plan as StampPlan, PointerStamp, ProofStamp, Unproven};
+pub use stamp::{
+    AggregateId, AggregateIdError, Plan as StampPlan, PointerStamp, ProofStamp, Unproven,
+};
